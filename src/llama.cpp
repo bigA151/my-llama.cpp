@@ -1,3 +1,28 @@
+/**
+ * llama.cpp 公共 API 实现
+ *
+ * 缩写词展开说明:
+ *   llama  = "Large Language Model" (大语言模型)
+ *   attn   = "attention" (注意力机制)
+ *   mmap   = "memory-mapped file" (内存映射文件)
+ *   mlock  = "memory lock" (内存锁)
+ *   gpu    = "Graphics Processing Unit" (图形处理器)
+ *   rpc    = "Remote Procedure Call" (远程过程调用)
+ *   numa   = "Non-Uniform Memory Access" (非统一内存访问)
+ *   buft   = "buffer type" (缓冲区类型)
+ *   kv     = "key-value" (键值对)
+ *   arch   = "architecture" (架构)
+ *   hparams = "hyperparameters" (超参数)
+ *   vocab  = "vocabulary" (词表)
+ *   ctx    = "context" (上下文)
+ *   tmpl   = "template" (模板)
+ *   ass    = "assistant" (助手)
+ *   devs   = "devices" (设备)
+ *   params = "parameters" (参数)
+ *   impl   = "implementation" (实现)
+ *   ud     = "user data" (用户数据)
+ */
+
 #include "llama.h"
 
 #include "llama-impl.h"
@@ -34,6 +59,12 @@
 // interface implementation
 //
 
+/**
+ * llama_flash_attn_type_name
+ * flash attention (FlashAttention, 快速注意力) 类型名称
+ * flash_attn_type: FlashAttention 类型枚举
+ * 返回: 对应类型的字符串名称 ("auto" / "disabled" / "enabled")
+ */
 const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_type) {
     switch (flash_attn_type) {
         case LLAMA_FLASH_ATTN_TYPE_AUTO:
@@ -46,6 +77,13 @@ const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_ty
     GGML_ABORT("fatal error");
 }
 
+/**
+ * llama_sampler_chain_default_params
+ * sampler chain (采样器链) 默认参数
+ * 返回: 默认的采样器链参数结构体
+ *
+ * 采样器链用于将多个采样策略组合起来使用
+ */
 struct llama_sampler_chain_params llama_sampler_chain_default_params() {
     struct llama_sampler_chain_params result = {
         /*.no_perf =*/ true,
@@ -54,22 +92,49 @@ struct llama_sampler_chain_params llama_sampler_chain_default_params() {
     return result;
 }
 
+/**
+ * llama_max_devices
+ * maximum devices (最大设备数量)
+ * 返回: 支持的最大计算设备数量
+ */
 size_t llama_max_devices(void) {
     return 16;
 }
 
+/**
+ * llama_max_tensor_buft_overrides
+ * maximum tensor buffer type overrides (张量缓冲区类型覆盖的最大数量)
+ * 返回: 允许的张量缓冲区类型覆盖的最大条目数
+ */
 size_t llama_max_tensor_buft_overrides() {
     return 4096;
 }
 
+/**
+ * llama_supports_mmap
+ * supports memory-mapped file (是否支持内存映射文件)
+ * 返回: 如果后端支持 mmap 则返回 true
+ */
 bool llama_supports_mmap(void) {
     return llama_mmap::SUPPORTED;
 }
 
+/**
+ * llama_supports_mlock
+ * supports memory lock (是否支持内存锁定)
+ * 返回: 如果后端支持 mlock (锁定内存防止换出) 则返回 true
+ */
 bool llama_supports_mlock(void) {
     return llama_mlock::SUPPORTED;
 }
 
+/**
+ * llama_supports_gpu_offload
+ * supports GPU (Graphics Processing Unit, 图形处理器) offload (卸载)
+ * 返回: 如果系统支持将计算卸载到 GPU 则返回 true
+ *
+ * 检查 GPU、集成 GPU 或 RPC 后端是否可用
+ */
 bool llama_supports_gpu_offload(void) {
     if (!ggml_backend_reg_count()) {
         ggml_backend_load_all();
@@ -79,6 +144,11 @@ bool llama_supports_gpu_offload(void) {
            llama_supports_rpc();
 }
 
+/**
+ * llama_supports_rpc
+ * supports RPC (Remote Procedure Call, 远程过程调用)
+ * 返回: 如果 RPC 后端已加载则返回 true
+ */
 bool llama_supports_rpc(void) {
     if (!ggml_backend_reg_count()) {
         ggml_backend_load_all();
@@ -86,6 +156,12 @@ bool llama_supports_rpc(void) {
     return ggml_backend_reg_by_name("RPC") != nullptr;
 }
 
+/**
+ * llama_backend_init
+ * backend (后端) initialize (初始化)
+ * 初始化 ggml 后端和时间模块
+ * 需要在调用其他 llama 函数前调用
+ */
 void llama_backend_init(void) {
     ggml_time_init();
 
@@ -101,6 +177,13 @@ void llama_backend_init(void) {
     }
 }
 
+/**
+ * llama_numa_init
+ * NUMA (Non-Uniform Memory Access, 非统一内存访问) initialize
+ * numa: NUMA 策略配置
+ *
+ * 在支持 NUMA 的系统上优化内存分配，提高多插槽 CPU 的内存访问效率
+ */
 void llama_numa_init(enum ggml_numa_strategy numa) {
     if (numa != GGML_NUMA_STRATEGY_DISABLED) {
         auto * dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
@@ -113,14 +196,37 @@ void llama_numa_init(enum ggml_numa_strategy numa) {
     }
 }
 
+/**
+ * llama_backend_free
+ * backend (后端) free (释放)
+ * 释放所有后端相关的资源
+ */
 void llama_backend_free(void) {
     ggml_quantize_free();
 }
 
+/**
+ * llama_time_us
+ * time (时间) in microseconds (微秒)
+ * 返回: 自某个固定起点以来的微秒数
+ */
 int64_t llama_time_us(void) {
     return ggml_time_us();
 }
 
+/**
+ * llama_prepare_model_devices
+ * prepare model (模型) devices (设备) — 准备模型运行所需的计算设备
+ * params: 模型参数，包含设备选择和分片策略
+ * model: 待配置设备的模型实例
+ *
+ * 返回: 成功返回 true，失败返回 false
+ *
+ * 根据 split_mode 将模型张量分配到合适的设备上:
+ *   - LLAMA_SPLIT_MODE_NONE: 仅使用 main_gpu
+ *   - LLAMA_SPLIT_MODE_LAYER: 按层分片到多个 GPU
+ *   - LLAMA_SPLIT_MODE_TENSOR: 按张量维度分片 (需要 Meta 设备聚合)
+ */
 // returns true on success
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
     // create list of devices to use with this model
@@ -272,6 +378,25 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
     return true;
 }
 
+/**
+ * llama_model_load
+ * model (模型) load (加载)
+ *
+ * metadata: GGUF 元数据上下文
+ * set_tensor_data: 设置张量数据的回调函数
+ * set_tensor_data_ud: set_tensor_data 的 user data (用户数据)
+ * fname: file name (文件名)
+ * splits: 分片路径列表 (用于分布式模型)
+ * file: 文件指针
+ * params: model parameters (模型参数)
+ *
+ * 返回: <状态码, 模型指针>
+ *   0  = 成功
+ *  -1  = 加载错误
+ *  -2  = 通过 progress_callback 取消
+ *
+ * 加载流程: 解析元数据 -> 创建模型对象 -> 加载超参数 -> 加载词表 -> 加载张量
+ */
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
 static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
@@ -335,6 +460,20 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
     }
 }
 
+/**
+ * llama_model_load_from_file_impl
+ * model load from file implementation (从文件加载模型的实现)
+ *
+ * metadata: GGUF 元数据 (可选)
+ * set_tensor_data: 设置张量数据的回调
+ * set_tensor_data_ud: set_tensor_data 的 user data
+ * path_model: 模型文件路径
+ * splits: 分片路径列表
+ * file: 已打开的文件指针 (可选)
+ * params: model parameters (模型参数)
+ *
+ * 注意: metadata / path_model / file 三者必须恰好有一个被指定
+ */
 static struct llama_model * llama_model_load_from_file_impl(
         struct gguf_context * metadata,
         llama_model_set_tensor_data_t set_tensor_data,
@@ -401,6 +540,16 @@ static struct llama_model * llama_model_load_from_file_impl(
     return model;
 }
 
+/**
+ * llama_model_init_from_user
+ * model initialize from user (从用户提供的元数据初始化模型)
+ *
+ * 通过用户传入的元数据上下文 (而非文件路径) 初始化模型
+ * metadata: GGUF 元数据上下文 (必须非空)
+ * set_tensor_data: 设置张量数据的回调
+ * set_tensor_data_ud: set_tensor_data 的 user data
+ * params: model parameters (模型参数)
+ */
 struct llama_model * llama_model_init_from_user(
         struct gguf_context * metadata,
         llama_model_set_tensor_data_t set_tensor_data,
@@ -410,9 +559,17 @@ struct llama_model * llama_model_init_from_user(
     std::string path_model;
     std::vector<std::string> splits = {};
     params.use_mmap = false;
-    params.use_extra_bufts = false;
+    params.use_extra_buffs = false;
     return llama_model_load_from_file_impl(metadata, set_tensor_data, set_tensor_data_ud, path_model, splits, /*file*/ nullptr, params);
 }
+
+/**
+ * llama_load_model_from_file
+ * load model from file (从文件加载模型) — 已废弃，请使用 llama_model_load_from_file
+ *
+ * path_model: 模型文件路径
+ * params: model parameters (模型参数)
+ */
 // deprecated
 struct llama_model * llama_load_model_from_file(
         const char * path_model,
@@ -420,6 +577,13 @@ struct llama_model * llama_load_model_from_file(
     return llama_model_load_from_file(path_model, params);
 }
 
+/**
+ * llama_model_load_from_file
+ * model load from file (从文件加载模型)
+ *
+ * path_model: 模型文件路径
+ * params: model parameters (模型参数)
+ */
 struct llama_model * llama_model_load_from_file(
         const char * path_model,
         struct llama_model_params params) {
@@ -427,6 +591,15 @@ struct llama_model * llama_model_load_from_file(
     return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, path_model, splits, /*file*/ nullptr, params);
 }
 
+/**
+ * llama_model_load_from_splits
+ * model load from splits (从分片文件列表加载模型)
+ *
+ * 支持从多个分片文件 (如 sharded model) 加载一个分布式模型
+ * paths: 分片文件路径数组
+ * n_paths: 分片文件数量
+ * params: model parameters (模型参数)
+ */
 struct llama_model * llama_model_load_from_splits(
         const char ** paths,
         size_t n_paths,
@@ -443,6 +616,14 @@ struct llama_model * llama_model_load_from_splits(
     return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, splits.front(), splits, /*file*/ nullptr, params);
 }
 
+/**
+ * llama_model_load_from_file_ptr
+ * model load from file pointer (从文件指针加载模型)
+ *
+ * 通过已打开的 FILE* 加载模型，而非通过文件路径
+ * file: 已打开的文件指针
+ * params: model parameters (模型参数)
+ */
 struct llama_model * llama_model_load_from_file_ptr(FILE * file, struct llama_model_params params) {
     if (!file) {
         LLAMA_LOG_ERROR("%s: file is NULL\n", __func__);
@@ -453,6 +634,13 @@ struct llama_model * llama_model_load_from_file_ptr(FILE * file, struct llama_mo
     return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, path_model, splits, file, params);
 }
 
+/**
+ * llama_model_save_to_file
+ * model save to file (将模型保存到文件)
+ *
+ * model: 要保存的模型
+ * path_model: 目标文件路径 (GGUF 格式)
+ */
 void llama_model_save_to_file(const struct llama_model * model, const char * path_model) {
     llama_model_saver ms(model);
     ms.add_kv_from_model();
@@ -461,9 +649,22 @@ void llama_model_save_to_file(const struct llama_model * model, const char * pat
 }
 
 //
-// chat templates
+// chat templates (聊天模板)
 //
 
+/**
+ * llama_chat_apply_template
+ * chat apply template (将聊天消息应用模板格式化)
+ *
+ * tmpl: template (模板) 字符串，可为 nullptr (默认使用 chatml)
+ * chat: 聊天消息数组
+ * n_msg: 消息数量 (number of messages)
+ * add_ass: 是否添加 assistant (助手) 前缀标记
+ * buf: 输出缓冲区
+ * length: buf 的最大长度
+ *
+ * 返回: 格式化后的字符串长度，失败返回 -1
+ */
 int32_t llama_chat_apply_template(
                               const char * tmpl,
          const struct llama_chat_message * chat,
@@ -496,9 +697,24 @@ int32_t llama_chat_apply_template(
 }
 
 //
-// model split
+// model split (模型分片)
 //
 
+/**
+ * llama_split_path
+ * split path (生成分片文件的完整路径)
+ *
+ * 将模型路径前缀与分片编号组合，生成标准格式的分片路径
+ * 格式: {path_prefix}-{split_no:05d}-of-{split_count:05d}.gguf
+ *
+ * split_path: 输出缓冲区，接收生成的路径
+ * maxlen: split_path 缓冲区的最大长度
+ * path_prefix: 路径前缀 (不含分片编号部分)
+ * split_no: 当前分片编号 (从 0 开始)
+ * split_count: 总分片数量
+ *
+ * 返回: 写入的字符数，失败返回 0
+ */
 int32_t llama_split_path(
     char * split_path,
     size_t maxlen,
@@ -524,6 +740,20 @@ int32_t llama_split_path(
     return (int32_t) written;
 }
 
+/**
+ * llama_split_prefix
+ * split prefix (从分片路径中提取路径前缀)
+ *
+ * 从分片文件路径中提取出不含分片编号的后缀部分
+ *
+ * split_prefix: 输出缓冲区，接收提取出的前缀
+ * maxlen: split_prefix 缓冲区的最大长度
+ * split_path: 分片文件路径 (如 model-00001-of-00003.gguf)
+ * split_no: 分片编号 (从 0 开始)
+ * split_count: 总分片数量
+ *
+ * 返回: 写入的字符数，失败返回 0
+ */
 int32_t llama_split_prefix(
     char * split_prefix,
     size_t maxlen,
@@ -553,6 +783,14 @@ int32_t llama_split_prefix(
     return 0;
 }
 
+/**
+ * llama_print_system_info
+ * print system info (打印系统信息)
+ *
+ * 返回: 包含所有已加载后端及其特性的字符串
+ *
+ * 遍历所有已注册的 ggml 后端，收集各后端的名称和特性信息
+ */
 const char * llama_print_system_info(void) {
     static std::string s;
     s.clear(); // Clear the string, since it's static, otherwise it will accumulate data from previous calls.

@@ -559,7 +559,7 @@ struct llama_model * llama_model_init_from_user(
     std::string path_model;
     std::vector<std::string> splits = {};
     params.use_mmap = false;
-    params.use_extra_buffs = false;
+    params.use_extra_bufts = false;
     return llama_model_load_from_file_impl(metadata, set_tensor_data, set_tensor_data_ud, path_model, splits, /*file*/ nullptr, params);
 }
 

@@ -1621,34 +1621,65 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+// =============================================================================
+// llama_context::decode
+// =============================================================================
+// 执行一次完整的前向传播：将一个批次的 token（通过 KV 缓存）前向通过整个模型，
+// 输出 logits（用于采样）、embeddings（用于嵌入提取）以及 pre-norm hidden states。
+//
+// 典型调用模式为自回归生成中每次调用 decode 一个 token：
+//   decode(batch_with_token[0])  →  logits for prompt tokens
+//   decode(batch_with_token[1])  →  logits for next token
+//   decode(batch_with_token[2])  →  ...
+// 每次调用会复用 ctx 中已有的 KV 缓存，无需重新计算历史 token 的 Attention。
+//
+// 参数：
+//   batch_inp - 输入批次，必须包含 token IDs (batch_inp.token) 或嵌入向量 (batch_inp.embd) 之一
+//
+// 返回值：
+//   0   - 成功
+//   1   - KV 缓存空间不足，batch 被截断（可重试减小 batch 大小）
+//  -1   - 输入参数错误（如 n_tokens == 0）
+//  -2   - 内存分配或批次初始化失败
+//  -3   - 计算执行失败
+//   2   - 计算被中止（abort）
+// =============================================================================
 int llama_context::decode(const llama_batch & batch_inp) {
-    // MTP hook batches carry both token (next-token id) and embd (h_pre_norm row),
-    // so accept either present rather than requiring exactly one.
+    // MTP (Multi-Token Prediction) hook 批次同时携带 token（next-token id）和
+    // embd（h_pre_norm 行），因此两者有一个存在即可。
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
 
+    // 如果当前上下文没有 KV 缓存（纯 embedding 提取场景），则回退到 encode()。
+    // encode() 不使用 KV 缓存，适用于只需要前向传播不需要自回归生成的场景。
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
         return encode(batch_inp);
     }
 
+    // 空批次直接报错
     if (batch_inp.n_tokens == 0) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
     }
 
+    // 获取词表大小和嵌入维度
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
     const int64_t n_vocab = vocab.n_tokens();
     const int64_t n_embd  = hparams.n_embd_inp();
 
-    // when computing embeddings, all tokens are output
+    // 当计算 embedding 时，所有 token 都应被输出
     const bool output_all   = cparams.embeddings;
+    // 是否有采样器（后端采样模式）
     const bool has_samplers = !sampling.samplers.empty();
 
+    // 最大序列数：统一 KV 缓存模式下使用系统上限，否则使用用户配置值
     const uint32_t n_seq_max = cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max;
 
-    // TODO: avoid this workaround in the future
+    // TODO: 避免此 workaround
+    // 后端采样模式下，每个序列最多只能有一个 token 需要输出 logits。
+    // 检查批次中是否有序列被要求输出多个 token（这在当前调度器下不支持）。
     if (has_samplers && batch_inp.logits) {
         std::vector<int32_t> seq_output_count(n_seq_max, 0);
 
@@ -1657,6 +1688,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 continue;
             }
 
+            // 获取该 token 所属的序列数量
             const int ns = batch_inp.n_seq_id ? batch_inp.n_seq_id[i] : 1;
 
             for (int32_t s = 0; s < ns; ++s) {
@@ -1672,16 +1704,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
+    // 初始化批次分配器：
+    // - 将输入批次中的 token 映射到 KV 缓存中的槽位
+    // - 确定哪些 token 需要输出 logits / embeddings
+    // - 处理序列重叠、位置编码等
     if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
 
+    // 获取本批次中 token 总数和需要输出的 token 总数
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
+    // embedding 提取模式要求所有 token 都被输出
     if (output_all) {
-        // require that all tokens are output
         if (n_outputs_all != n_tokens_all) {
             LLAMA_LOG_ERROR("%s: pooled embedding requires that all tokens are output (n_outputs_all = %d, n_tokens_all = %d)\n",
                     __func__, n_outputs_all, n_tokens_all);
@@ -1689,28 +1726,36 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
+    // 安全检查：token 数不能超过用户配置的 n_batch
     GGML_ASSERT(n_tokens_all <= cparams.n_batch);
 
+    // 非因果 Attention 模式（用于 Encoder-Decoder 模型如 T5）要求 n_ubatch >= n_tokens
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
 
+    // 记录首次计算的时间戳（用于性能统计）
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
     }
     n_queued_tokens += n_tokens_all;
 
-    // TODO: this clear of the buffer can easily be forgotten - need something better
+    // 清理序列 embedding 输出缓冲区和输出置换记录
     embd_seq.clear();
     output_swaps.clear();
 
+    // 调度器预分配内存
     sched_reserve();
 
     bool did_optimize = false;
 
-    // handle any pending shifts/copies
+    // 处理 KV 缓存中待执行的 shift/copy 操作（如 RoPE 位置调整）
     memory_update(false);
 
     llama_memory_context_ptr mctx;
 
+    // =============================================================================
+    // 尝试将批次加载到 KV 缓存中
+    // 如果空间不足，可能需要触发缓存优化（驱逐旧序列）后重试
+    // =============================================================================
     while (true) {
         mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
         if (!mctx) {
@@ -1719,75 +1764,80 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         switch (mctx->get_status()) {
             case LLAMA_MEMORY_STATUS_SUCCESS:
-                {
-                } break;
+                // 成功，无需额外操作
+                break;
             case LLAMA_MEMORY_STATUS_NO_UPDATE:
-                {
-                    LLAMA_LOG_ERROR("%s: unexpected memory context status: %d\n", __func__, mctx->get_status());
-
-                    return -2;
-                }
+                // 不应该有此状态，表明内部逻辑出错
+                LLAMA_LOG_ERROR("%s: unexpected memory context status: %d\n", __func__, mctx->get_status());
+                return -2;
             case LLAMA_MEMORY_STATUS_FAILED_PREPARE:
-                {
-                    if (!did_optimize) {
-                        did_optimize = true;
+                // KV 缓存空间不足，尝试优化后重试
+                if (!did_optimize) {
+                    did_optimize = true;
 
-                        if (memory_update(true)) {
-                            LLAMA_LOG_DEBUG("%s: retrying batch size %d after cache optimization\n", __func__, balloc->get_n_tokens());
-
-                            continue;
-                        }
+                    // 触发缓存优化：可能驱逐最早的序列以腾出空间
+                    if (memory_update(true)) {
+                        LLAMA_LOG_DEBUG("%s: retrying batch size %d after cache optimization\n", __func__, balloc->get_n_tokens());
+                        continue;  // 重试
                     }
-
-                    LLAMA_LOG_WARN("%s: failed to find a memory slot for batch of size %d\n", __func__, balloc->get_n_tokens());
-
-                    return 1;
                 }
+
+                // 优化后仍然失败：缓存确实装不下，返回 1 表示截断
+                LLAMA_LOG_WARN("%s: failed to find a memory slot for batch of size %d\n", __func__, balloc->get_n_tokens());
+                return 1;
             case LLAMA_MEMORY_STATUS_FAILED_COMPUTE:
-                {
-                    LLAMA_LOG_ERROR("%s: compute failed while preparing batch of size %d\n", __func__, balloc->get_n_tokens());
-
-                    return -2;
-                }
+                // 计算失败（而非准备阶段失败）
+                LLAMA_LOG_ERROR("%s: compute failed while preparing batch of size %d\n", __func__, balloc->get_n_tokens());
+                return -2;
         }
 
         break;
     }
 
-    // reserve output buffer
+    // 为输出（logits、embeddings）预分配缓冲区
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
 
+    // 跟踪已处理的输出和 token 数量（用于多 ubatch 场景下的偏移计算）
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    // =============================================================================
+    // 主处理循环：遍历所有 ubatch（micro-batch）
+    // 一个批次可能被拆分为多个 ubatch，每个 ubatch 独立构建并执行计算图
+    // =============================================================================
     do {
         const auto & ubatch = mctx->get_ubatch();
 
-        // count the outputs in this ubatch
+        // 统计当前 ubatch 中需要输出的 token 数量
         {
             int32_t n_outputs_new = 0;
 
             if (n_outputs_all == n_tokens_all) {
+                // 所有 token 都需要输出，直接用 token 数
                 n_outputs_new = ubatch.n_tokens;
             } else {
+                // 只有部分 token 需要输出（logits[token] != 0）
                 for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
                     n_outputs_new += (int32_t) (ubatch.output[i] != 0);
                 }
             }
 
-            // needs to happen before the graph is built
+            // 必须在构建计算图之前设置
             n_outputs = n_outputs_new;
         }
 
         ggml_status status;
 
+        // 构建并执行当前 ubatch 的计算图
+        // 内部会：embedding → 所有 Transformer 层 → 输出 logits/embeddings/h_pre_norm
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
 
+        // process_ubatch 失败：回滚 KV 缓存中该 ubatch 的写入
         if (!res) {
-            // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
+            // 找出该 ubatch 中每个序列的最小位置，从该位置起全部清除
             llama_pos pos_min[LLAMA_MAX_SEQ];
             for (int s = 0; s < LLAMA_MAX_SEQ; ++s) {
                 pos_min[s] = std::numeric_limits<llama_pos>::max();
@@ -1795,7 +1845,6 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
                 const auto & seq_id = ubatch.seq_id[i][0];
-
                 pos_min[seq_id] = std::min(pos_min[seq_id], ubatch.pos[i]);
             }
 
@@ -1803,12 +1852,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 if (pos_min[s] == std::numeric_limits<llama_pos>::max()) {
                     continue;
                 }
-
                 LLAMA_LOG_WARN("%s: removing memory module entries for seq_id = %d, pos = [%d, +inf)\n", __func__, s, pos_min[s]);
-
                 memory->seq_rm(s, pos_min[s], -1);
             }
 
+            // 根据失败原因返回对应错误码
             switch (status) {
                 case GGML_STATUS_ABORTED:      return  2;
                 case GGML_STATUS_ALLOC_FAILED: return -2;
@@ -1817,35 +1865,39 @@ int llama_context::decode(const llama_batch & batch_inp) {
             }
         }
 
-        // plot the computation graph in dot format (for debugging purposes)
-        //if (n_past%100 == 0) {
-        //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
-        //}
-
+        // 从 process_ubatch 的结果中提取各个输出张量
         auto * t_logits        = res->get_logits();
         auto * t_embd          = cparams.embeddings          ? res->get_embd()        : nullptr;
         auto * t_h_pre_norm    = cparams.embeddings_pre_norm ? res->get_h_pre_norm()  : nullptr;
 
+        // 如果有池化 embedding，优先使用池化版本
         if (t_embd && res->get_embd_pooled()) {
             t_embd = res->get_embd_pooled();
         }
 
-        // extract logits
+        // =============================================================================
+        // 提取 logits：从设备异步拷贝到主机内存
+        // =============================================================================
         if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
 
-            float * logits_out = logits.data + n_outputs_prev*n_vocab;
+            // logits_out 指向 logits 缓冲区中当前 ubatch 对应输出行的起始位置
+            float * logits_out = logits.data + n_outputs_prev * n_vocab;
 
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
-                GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                GGML_ASSERT((n_outputs_prev + n_outputs) * n_vocab <= (int64_t) logits.size);
+                // 异步拷贝：形状为 [n_outputs, n_vocab] 的 logits 张量
+                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs * n_vocab * sizeof(float));
             }
         }
 
-        // extract embeddings
+        // =============================================================================
+        // 提取 embeddings（可选）
+        // 支持多种池化模式，决定输出的是每个 token 的 embedding 还是整个序列的聚合 embedding
+        // =============================================================================
         if (embd.data && t_embd && n_outputs > 0) {
             ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
             GGML_ASSERT(backend_embd != nullptr);
@@ -1853,26 +1905,25 @@ int llama_context::decode(const llama_batch & batch_inp) {
             switch (cparams.pooling_type) {
                 case LLAMA_POOLING_TYPE_NONE:
                     {
-                        // extract token embeddings
+                        // 每个 token 独立输出 embedding（维度 n_embd_out）
                         GGML_ASSERT(embd.data != nullptr);
                         const uint32_t n_embd_out = hparams.n_embd_out();
-                        float * embd_out = embd.data + n_outputs_prev*n_embd_out;
+                        float * embd_out = embd.data + n_outputs_prev * n_embd_out;
 
                         if (n_outputs) {
                             GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
-                            GGML_ASSERT((n_outputs_prev + n_outputs)*n_embd_out <= (int64_t) embd.size);
-                            ggml_backend_tensor_get_async(backend_embd, t_embd, embd_out, 0, n_outputs*n_embd_out*sizeof(float));
+                            GGML_ASSERT((n_outputs_prev + n_outputs) * n_embd_out <= (int64_t) embd.size);
+                            ggml_backend_tensor_get_async(backend_embd, t_embd, embd_out, 0, n_outputs * n_embd_out * sizeof(float));
                         }
                     } break;
                 case LLAMA_POOLING_TYPE_MEAN:
                 case LLAMA_POOLING_TYPE_CLS:
                 case LLAMA_POOLING_TYPE_LAST:
                     {
-                        // extract sequence embeddings (cleared before processing each batch)
+                        // 序列级 embedding：对整个序列做平均/取首 token/取尾 token
+                        // 输出形状为 [n_embd_out] 而非 [n_tokens, n_embd_out]
                         auto & embd_seq_out = embd_seq;
 
-                        // use n_embd_out (not n_embd_inp) - the pooled embedding has the model's
-                        // output dimension, which differs from input dimension for deepstack models (e.g. qwen3vl)
                         const uint32_t n_embd_out = hparams.n_embd_out();
 
                         for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
@@ -1880,12 +1931,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
                             const int32_t      seq_idx = ubatch.seq_idx[seq_id];
 
                             embd_seq_out[seq_id].resize(n_embd_out);
-                            ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_embd_out*seq_idx)*sizeof(float), n_embd_out*sizeof(float));
+                            // seq_idx 指示该序列 embedding 在 batch 结果中的行索引
+                            ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(),
+                                    (n_embd_out * seq_idx) * sizeof(float), n_embd_out * sizeof(float));
                         }
                     } break;
                 case LLAMA_POOLING_TYPE_RANK:
                     {
-                        // extract the rerank score - n_cls_out floats per sequence
+                        // 排序任务的分数输出（reranker 模型）
                         auto & embd_seq_out = embd_seq;
 
                         const uint32_t n_cls_out = hparams.n_cls_out;
@@ -1895,18 +1948,19 @@ int llama_context::decode(const llama_batch & batch_inp) {
                             const int32_t      seq_idx = ubatch.seq_idx[seq_id];
 
                             embd_seq_out[seq_id].resize(n_cls_out);
-                            ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(), (n_cls_out*seq_idx)*sizeof(float), n_cls_out*sizeof(float));
+                            ggml_backend_tensor_get_async(backend_embd, t_embd, embd_seq_out[seq_id].data(),
+                                    (n_cls_out * seq_idx) * sizeof(float), n_cls_out * sizeof(float));
                         }
                     } break;
                 case LLAMA_POOLING_TYPE_UNSPECIFIED:
-                    {
-                        GGML_ABORT("unknown pooling type");
-                    }
+                    GGML_ABORT("unknown pooling type");
             }
         }
 
-        // extract pre-norm embeddings (hidden state before the final output norm)
-        // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
+        // =============================================================================
+        // 提取 pre-norm hidden states（归一化前的隐藏状态，可选）
+        // 仅在 LLAMA_POOLING_TYPE_NONE 下有意义
+        // =============================================================================
         {
             const bool masked    = cparams.embeddings_pre_norm_masked;
             const int64_t n_rows = masked ? n_outputs       : (int64_t) ubatch.n_tokens;
@@ -1917,34 +1971,40 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 GGML_ASSERT(backend_h != nullptr);
 
                 const uint32_t n_embd = hparams.n_embd;
-                float * embd_pre_norm_out = embd_pre_norm.data + offset*n_embd;
+                float * embd_pre_norm_out = embd_pre_norm.data + offset * n_embd;
 
-                GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_pre_norm.size);
-                ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_pre_norm_out, 0, n_rows*n_embd*sizeof(float));
+                GGML_ASSERT((offset + n_rows) * n_embd <= (int64_t) embd_pre_norm.size);
+                ggml_backend_tensor_get_async(backend_h, t_h_pre_norm, embd_pre_norm_out, 0, n_rows * n_embd * sizeof(float));
             }
         }
 
-        // Copy backend sampling output if this ubatch produced any sampling tensors.
+        // =============================================================================
+        // 提取后端采样器的输出数据（如 token IDs、概率、logits 等）
+        // 仅当有采样器且 ubatch 产生了对应张量时才执行
+        // =============================================================================
         if (has_samplers && (!res->t_sampled.empty() || !res->t_sampled_probs.empty() || !res->t_sampled_logits.empty())) {
             const auto seq_to_output_row = build_seq_to_output_row(ubatch, n_outputs_prev);
             const auto stride = n_vocab;
 
-            // async copy the sampling data from the backend to the host
-            copy_tensor_async_ints(res->t_sampled, sampling.sampled, seq_to_output_row, sched.get());
-
-            copy_tensor_async_floats    (res->t_sampled_logits, sampling.logits,     stride, sampling.logits_count,     seq_to_output_row, sched.get());
-            copy_tensor_async_floats    (res->t_sampled_probs,  sampling.probs,      stride, sampling.probs_count,      seq_to_output_row, sched.get());
-            copy_tensor_async_candidates(res->t_candidates,     sampling.candidates, stride, sampling.candidates_count, seq_to_output_row, sched.get());
+            // 异步从设备拷贝采样数据到主机
+            copy_tensor_async_ints   (res->t_sampled,      sampling.sampled,      seq_to_output_row, sched.get());
+            copy_tensor_async_floats (res->t_sampled_logits, sampling.logits,   stride, sampling.logits_count,     seq_to_output_row, sched.get());
+            copy_tensor_async_floats (res->t_sampled_probs,  sampling.probs,    stride, sampling.probs_count,      seq_to_output_row, sched.get());
+            copy_tensor_async_candidates(res->t_candidates, sampling.candidates, stride, sampling.candidates_count, seq_to_output_row, sched.get());
         }
 
+        // 更新偏移量，为下一个 ubatch 的输出拷贝做准备
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
-    } while (mctx->next());
+    } while (mctx->next());  // 遍历下一个 ubatch
 
-    // set to total number of outputs in the batch, for use in llama_get_logits_ith
+    // 将 n_outputs 设置为整个批次的输出总数，供 llama_get_logits_ith 使用
     n_outputs = n_outputs_all;
 
-    // set output mappings
+    // =============================================================================
+    // 建立输出映射：用户提供的批次中 token 顺序可能与 KV 缓存中不同
+    // 需要确保返回的 logits/embeddings 顺序与用户输入顺序一致
+    // =============================================================================
     if (n_outputs > 0) {
         bool sorted_output = true;
 
@@ -1952,21 +2012,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
         GGML_ASSERT(out_ids.size() == (size_t) n_outputs);
 
+        // 建立 output_ids 数组：output_ids[用户批次中的输出索引] = 结果中的行号
         for (int64_t i = 0; i < n_outputs; ++i) {
             int64_t out_id = out_ids[i];
             output_ids[out_id] = i;
             if (out_id != i) {
-                sorted_output = false;
+                sorted_output = false;  // 如果顺序相同则无需重排
             }
         }
 
-        // make the outputs have the same order they had in the user-provided batch
-        // note: this is mostly relevant for recurrent models atm
+        // 如果输出顺序与用户批次顺序不一致（常见于 recurrent 模型），
+        // 使用选择排序将结果重排为用户期望的顺序
         if (!sorted_output && n_outputs > 1) {
             GGML_ASSERT((size_t) n_outputs == out_ids.size());
 
-            // TODO: is there something more efficient which also minimizes swaps?
-            // selection sort, to minimize swaps (from https://en.wikipedia.org/wiki/Selection_sort)
+            // 选择排序：最小化 swap 次数
             for (uint32_t i = 0; i < n_outputs - 1; ++i) {
                 uint32_t j_min = i;
                 for (uint32_t j = i + 1; j < n_outputs; ++j) {
@@ -1979,20 +2039,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 }
                 std::swap(out_ids[i], out_ids[j_min]);
 
-                // remember the swaps and apply them lazily upon logits/embeddings access
+                // 记录 swap 操作，在访问 logits/embeddings 时惰性应用
                 output_swaps.push_back({ i, j_min });
             }
 
             std::fill(output_ids.begin(), output_ids.end(), -1);
 
+            // 重新建立映射
             for (uint32_t i = 0; i < n_outputs; ++i) {
                 output_ids[out_ids[i]] = i;
             }
         }
     }
 
-    // wait for the computation to finish (automatically done when obtaining the model output)
-    //synchronize();
+    // 等待所有异步操作完成（获取模型输出时自动同步）
+    // synchronize();
 
     return 0;
 }

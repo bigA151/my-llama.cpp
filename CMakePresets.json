@@ -80,16 +80,18 @@
     { "name": "x64-windows-llvm-reldbg", "inherits": [ "base", "x64-windows-llvm", "reldbg" ] },
     { "name": "x64-windows-llvm+static-release", "inherits": [ "base", "x64-windows-llvm", "reldbg", "static" ] },
 
-    { "name": "x64-windows-msvc-debug", "inherits": [ "base", "debug" ] },
-    { "name": "x64-windows-msvc-release", "inherits": [ "base", "reldbg" ] },
-    { "name": "x64-windows-msvc+static-release", "inherits": [ "base", "reldbg", "static" ] },
-
-    { "name": "x64-windows-sycl-debug", "inherits": [ "sycl-base", "debug" ] },
-    { "name": "x64-windows-sycl-debug-f16", "inherits": [ "sycl-base", "debug", "sycl_f16" ] },
-    { "name": "x64-windows-sycl-release", "inherits": [ "sycl-base", "release" ] },
-    { "name": "x64-windows-sycl-release-f16", "inherits": [ "sycl-base", "release", "sycl_f16" ] },
+    { "name": "x64-windows-msvc-base", "hidden": true, "cacheVariables": {
+        "CMAKE_C_COMPILER": "cl",
+        "CMAKE_CXX_COMPILER": "cl"
+    } },
+    { "name": "x64-windows-msvc-debug", "inherits": [ "base", "x64-windows-msvc-base", "debug" ] },
+    { "name": "x64-windows-msvc-release", "inherits": [ "base", "x64-windows-msvc-base", "reldbg" ] },
+    { "name": "x64-windows-msvc+static-release", "inherits": [ "base", "x64-windows-msvc-base", "reldbg", "static" ] },
 
     { "name": "x64-windows-vulkan-debug", "inherits": [ "base", "vulkan", "debug" ] },
-    { "name": "x64-windows-vulkan-release", "inherits": [ "base", "vulkan", "release" ] }
+    { "name": "x64-windows-vulkan-release", "inherits": [ "base", "vulkan", "release" ] },
+
+    { "name": "x64-windows-msvc-vulkan-debug", "inherits": [ "base", "x64-windows-msvc-base", "vulkan", "debug" ] },
+    { "name": "x64-windows-msvc-vulkan-release", "inherits": [ "base", "x64-windows-msvc-base", "vulkan", "release" ] }
   ]
 }

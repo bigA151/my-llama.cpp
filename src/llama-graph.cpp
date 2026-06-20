@@ -1323,6 +1323,28 @@ ggml_tensor * llm_graph_context::build_ffn(
     return cur;
 }
 
+// =============================================================================
+// MoE FFN（Mixture-of-Experts Feed-Forward Network，混合专家前馈网络）构建函数
+// 参数说明：
+//   cur         - 当前层的隐藏状态（hidden states），形状 [n_tokens, n_embd]
+//   gate_inp    - Gate 投影权重矩阵，形状 [n_expert, n_embd]
+//   up_exps     - Up 投影权重矩阵（专家 FFN 第一层的一半），形状 [n_expert, n_ff, n_embd]
+//   gate_exps   - Gate 投影权重矩阵（SwiGLU 等激活中的门控分支），形状 [n_expert, n_ff, n_embd]
+//   down_exps   - Down 投影权重矩阵（专家 FFN 第二层），形状 [n_expert, n_embd, n_ff]
+//   exp_probs_b - Expert Selection Bias（专家选择偏置，DeepSeek V3 引入），形状 [n_expert]
+//   n_expert    - 专家总数
+//   n_expert_used - 每个 token 实际使用的专家数量（即 Top-K 中的 K）
+//   type_op     - FFN 操作类型（SwiGLU / GeGLU / GELU 等）
+//   norm_w      - 是否对专家权重做归一化（normalize weights）
+//   w_scale     - 专家权重的额外缩放因子（weight scale）
+//   gating_op   - 门控激活函数类型（SOFTMAX / SIGMOID / SOFTMAX_WEIGHT）
+//   il          - 当前层索引（用于回调日志）
+//   probs_in    - 预计算的 probs（若非空则跳过 gate 矩阵乘法）
+//   gate_up_exps - 融合的 Gate+Up 权重（减少内存访问），形状 [n_expert, n_ff*2, n_embd]
+//   up_exps_s   - Up 投影的 per-expert 缩放因子
+//   gate_exps_s - Gate 投影的 per-expert 缩放因子
+//   down_exps_s - Down 投影的 per-expert 缩放因子
+// =============================================================================
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -1335,13 +1357,16 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
      llm_ffn_op_type   type_op,
                 bool   norm_w,
                float   w_scale,
-         llama_expert_gating_func_type gating_op,
+        llama_expert_gating_func_type gating_op,
                  int   il,
          ggml_tensor * probs_in,
          ggml_tensor * gate_up_exps,
          ggml_tensor * up_exps_s,
          ggml_tensor * gate_exps_s,
          ggml_tensor * down_exps_s) const {
+    // =============================================================================
+    // 简化重载版本：将所有偏置参数置为 nullptr，统一调用下面的完整版本
+    // =============================================================================
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -1365,58 +1390,83 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     );
 }
 
+// =============================================================================
+// MoE FFN 完整构建函数（包含所有偏置和融合优化参数）
+// 核心流程：
+//   1. Gate 计算：cur 与 gate_inp 矩阵相乘得到原始评分（logits）
+//   2. 激活函数：将 logits 转换为概率分布（probs）
+//   3. 专家分组选择（可选，DeepSeek V3 等模型）：先选专家组，再在组内选专家
+//   4. Top-K 选择：根据概率选出 n_expert_used 个专家
+//   5. 权重提取：根据选中的专家索引取出对应权重
+//   6. FFN 计算：使用选中的专家权重计算最终输出
+// =============================================================================
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
-         ggml_tensor * gate_inp,
-         ggml_tensor * gate_inp_b,
-         ggml_tensor * up_exps,
-         ggml_tensor * up_exps_b,
-         ggml_tensor * gate_exps,
-         ggml_tensor * gate_exps_b,
-         ggml_tensor * down_exps,
-         ggml_tensor * down_exps_b,
-         ggml_tensor * exp_probs_b,
-             int64_t   n_expert,
-             int64_t   n_expert_used,
-     llm_ffn_op_type   type_op,
-                bool   norm_w,
-               float   w_scale,
-        llama_expert_gating_func_type gating_op,
-                 int   il,
-         ggml_tensor * probs_in,
-         ggml_tensor * gate_up_exps,
-         ggml_tensor * gate_up_exps_b,
-         ggml_tensor * up_exps_s,
-         ggml_tensor * gate_exps_s,
-         ggml_tensor * down_exps_s) const {
+         ggml_tensor * gate_inp,        // Gate 投影权重，形状 [n_expert, n_embd]
+         ggml_tensor * gate_inp_b,      // Gate 投影偏置（gate input bias），形状 [n_expert]
+         ggml_tensor * up_exps,         // Up 投影权重（up experts），形状 [n_expert, n_ff, n_embd]
+         ggml_tensor * up_exps_b,      // Up 投影偏置（up experts bias）
+         ggml_tensor * gate_exps,       // Gate 投影权重（gate experts，用于 SwiGLU 等激活）
+         ggml_tensor * gate_exps_b,     // Gate 投影偏置（gate experts bias）
+         ggml_tensor * down_exps,       // Down 投影权重（down experts），形状 [n_expert, n_embd, n_ff]
+         ggml_tensor * down_exps_b,     // Down 投影偏置（down experts bias）
+         ggml_tensor * exp_probs_b,     // 专家选择偏置（expert probabilities bias，DeepSeek V3）
+             int64_t   n_expert,        // 专家总数
+             int64_t   n_expert_used,   // 每个 token 使用的专家数（Top-K 中的 K）
+     llm_ffn_op_type   type_op,        // FFN 操作类型
+                bool   norm_w,          // 是否归一化专家权重（normalize weights）
+               float   w_scale,         // 权重缩放因子（weight scale）
+        llama_expert_gating_func_type gating_op, // 门控激活函数类型
+                 int   il,              // 层索引（用于回调日志）
+         ggml_tensor * probs_in,       // 预计算的概率（若非空则跳过 gate 计算）
+         ggml_tensor * gate_up_exps,    // 融合的 Gate+Up 权重，形状 [n_expert, n_ff*2, n_embd]
+         ggml_tensor * gate_up_exps_b,  // 融合投影的偏置
+         ggml_tensor * up_exps_s,       // Up 投影的 per-expert 缩放因子（up experts scale）
+         ggml_tensor * gate_exps_s,     // Gate 投影的 per-expert 缩放因子（gate experts scale）
+         ggml_tensor * down_exps_s) const { // Down 投影的 per-expert 缩放因子（down experts scale）
+    // 提取隐藏维度（n_embd = hidden dimension，嵌入维度）和 token 数量
     const int64_t n_embd   = cur->ne[0];
     const int64_t n_tokens = cur->ne[1];
-    const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+    // 对于 Llama4，在 FFN 计算之前就应用 sigmoid 后的权重（weight before FFN）
+    const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4;
 
+    // =============================================================================
+    // 步骤 1：Gate 计算 - 计算每个 token 对每个专家的原始评分（raw logits）
+    // =============================================================================
     ggml_tensor * logits = nullptr;
 
     if (probs_in == nullptr) {
+        // cur [n_tokens, n_embd] @ gate_inp.T [n_embd, n_expert] -> logits [n_tokens, n_expert]
+        // build_lora_mm 执行矩阵乘法（matrix multiplication），结果转置为 [n_expert, n_tokens]
         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
         cb(logits, "ffn_moe_logits", il);
     } else {
+        // 外部已预计算 probs，直接使用
         logits = probs_in;
     }
 
+    // 可选：添加 Gate 输入偏置（gate input bias）
     if (gate_inp_b) {
         logits = ggml_add(ctx0, logits, gate_inp_b);
         cb(logits, "ffn_moe_logits_biased", il);
     }
 
+    // =============================================================================
+    // 步骤 2：激活函数 - 将原始评分转换为概率分布（probabilities）
+    // =============================================================================
     ggml_tensor * probs = nullptr;
     switch (gating_op) {
+        // SOFTMAX：所有专家竞争，概率之和为 1
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
             {
                 probs = ggml_soft_max(ctx0, logits); // [n_expert, n_tokens]
             } break;
+        // SIGMOID：每个专家独立做二分类，概率范围 [0, 1]（不保证和为 1）
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:
             {
                 probs = ggml_sigmoid(ctx0, logits); // [n_expert, n_tokens]
             } break;
+        // SOFTMAX_WEIGHT：logits 本身作为权重，稍后在 Top-K 之后再做 softmax
         case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT:
             {
                 probs = logits; // [n_expert, n_tokens]
@@ -1426,68 +1476,105 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
     cb(probs, "ffn_moe_probs", il);
 
-    // add experts selection bias - introduced in DeepSeek V3
-    // leave probs unbiased as it's later used to get expert weights
-    ggml_tensor * selection_probs = probs;
+    // =============================================================================
+    // 步骤 3：添加专家选择偏置（Expert Selection Bias）- DeepSeek V3 引入
+    // 允许在推理时通过调整偏置来启用/禁用某些专家
+    // 注意：保持原始 probs 不变，因为后续需要用未偏置的 probs 来获取专家权重
+    // =============================================================================
+    ggml_tensor * selection_probs = probs; // selection_probs 用于专家选择决策
     if (exp_probs_b != nullptr) {
         selection_probs = ggml_add(ctx0, probs, exp_probs_b);
         cb(selection_probs, "ffn_moe_probs_biased", il);
     }
 
-    // llama4 doesn't have exp_probs_b, and sigmoid is only used after top_k
-    // see: https://github.com/meta-llama/llama-models/blob/699a02993512fb36936b1b0741e13c06790bcf98/models/llama4/moe.py#L183-L198
+    // =============================================================================
+    // 步骤 4：特殊架构处理
+    // =============================================================================
+
+    // Llama4 不使用 exp_probs_b，且 sigmoid 只在 Top-K 之后应用
+    // 参考: https://github.com/meta-llama/llama-models/blob/.../moe.py#L183-L198
     if (arch == LLM_ARCH_LLAMA4) {
-        selection_probs = logits;
+        selection_probs = logits; // 直接使用原始 logits 进行选择
     }
 
+    // GrooveMoE：对 selection_probs 应用 sigmoid 激活
     if (arch == LLM_ARCH_GROVEMOE) {
         selection_probs = ggml_sigmoid(ctx0, logits); // [n_expert, n_tokens]
         cb(selection_probs, "ffn_moe_probs_biased", il);
     }
 
-    // select top n_group_used expert groups
-    // https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/e815299b0bcbac849fa540c768ef21845365c9eb/modeling_deepseek.py#L440-L457
+    // =============================================================================
+    // 步骤 5：专家分组选择 - DeepSeek V3 的多专家组机制
+    // 背景：总共有 n_expert 个专家，分为 n_expert_groups 个组，每组 n_exp_per_group 个专家
+    // 流程：先在组级别做 Top-K 选出口碑最好的 n_group_used 个组，再在组内选专家
+    // 参考: https://huggingface.co/deepseek-ai/DeepSeek-V3/.../modeling_deepseek.py#L440-L457
+    // =============================================================================
     if (hparams.n_expert_groups > 1 && n_tokens > 0) {
         const int64_t n_exp_per_group = n_expert / hparams.n_expert_groups;
 
-        // organize experts into n_expert_groups
+        // 将概率矩阵重组为 3D：张量维度 [n_exp_per_group, n_expert_groups, n_tokens]
+        // 即每行代表一个专家组，每组包含 n_exp_per_group 个专家的概率
         ggml_tensor * selection_groups = ggml_reshape_3d(ctx0, selection_probs, n_exp_per_group, hparams.n_expert_groups, n_tokens); // [n_exp_per_group, n_expert_groups, n_tokens]
 
+        // 在每个专家组内做 Top-2 排序（取每个组内概率最高的 2 个专家索引）
+        // argsort_top_k 返回排序后的索引，形状 [2, n_expert_groups, n_tokens]
         ggml_tensor * group_scores = ggml_argsort_top_k(ctx0, selection_groups, 2); // [2, n_expert_groups, n_tokens]
+        // 根据索引取出对应的概率值
         group_scores = ggml_get_rows(ctx0, ggml_reshape_4d(ctx0, selection_groups, 1, selection_groups->ne[0], selection_groups->ne[1], selection_groups->ne[2]), group_scores); // [1, 2, n_expert_groups, n_tokens]
 
-        // get top n_group_used expert groups
+        // 将 Top-2 的概率求和，作为该专家组的"组分数"（group scores）
         group_scores = ggml_sum_rows(ctx0, ggml_reshape_3d(ctx0, group_scores, group_scores->ne[1], group_scores->ne[2], group_scores->ne[3])); // [1, n_expert_groups, n_tokens]
         group_scores = ggml_reshape_2d(ctx0, group_scores, group_scores->ne[1], group_scores->ne[2]); // [n_expert_groups, n_tokens]
 
+        // 在组级别做 Top-K 选择，选出 n_group_used 个最好的专家组
         ggml_tensor * expert_groups = ggml_argsort_top_k(ctx0, group_scores, hparams.n_group_used); // [n_group_used, n_tokens]
         cb(expert_groups, "ffn_moe_group_topk", il);
 
-        // mask out the other groups
+        // 将未被选中的专家组概率置为 -INFINITY（掩码），使其不会在后续被选中
+        // 先取出被选中组的概率
         selection_probs = ggml_get_rows(ctx0, selection_groups, expert_groups); // [n_exp_per_group, n_group_used, n_tokens]
+        // 用 -INFINITY 填充未被选中的位置
         selection_probs = ggml_set_rows(ctx0, ggml_fill(ctx0, selection_groups, -INFINITY), selection_probs, expert_groups); // [n_exp_per_group, n_expert_groups, n_tokens]
+        // 重新展平为 2D [n_expert, n_tokens]
         selection_probs = ggml_reshape_2d(ctx0, selection_probs, n_expert, n_tokens); // [n_expert, n_tokens]
         cb(selection_probs, "ffn_moe_probs_masked", il);
     }
 
-    // select experts
+    // =============================================================================
+    // 步骤 6：Top-K 专家选择 - 从所有专家中选出概率最高的 n_expert_used 个
+    // 使用 argsort_top_k 按概率降序排列后取前 K 个专家索引
+    // =============================================================================
+    // selected_experts 形状 [n_expert_used, n_tokens]，每列存储一个 token 选中的专家索引
     ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
     cb(selected_experts->src[0], "ffn_moe_argsort", il);
     cb(selected_experts, "ffn_moe_topk", il);
 
+    // =============================================================================
+    // 步骤 7：GrooveMoE 特殊处理 - 将专家索引映射到组内索引
+    // =============================================================================
     if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
-        // TODO: Use scalar div instead when/if implemented
+        // TODO: 当支持标量除法时应使用标量除法替代
         ggml_tensor * f_sel = ggml_cast(ctx0, selected_experts, GGML_TYPE_F32);
+        // 将专家索引除以每组专家数，得到组内索引
         selected_experts = ggml_cast(ctx0, ggml_scale(ctx0, f_sel, 1.0f / float(hparams.n_group_experts)), GGML_TYPE_I32);
         probs = ggml_reshape_3d(ctx0, probs, 1, hparams.n_expert, n_tokens);
     } else {
         probs = ggml_reshape_3d(ctx0, probs, 1, n_expert, n_tokens);
     }
 
+    // =============================================================================
+    // 步骤 8：根据选中的专家索引提取对应的概率权重
+    // get_rows 根据 selected_experts 中的索引从 probs 中取出对应位置的值
+    // =============================================================================
+    // weights 形状 [1, n_expert_used, n_tokens]，每个 token 的每个选中专家对应一个权重
     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
 
 
+    // =============================================================================
+    // 步骤 9：SOFTMAX_WEIGHT 模式 - 在 Top-K 之后对权重再做一次 softmax
+    // 这种模式下前面没有做激活函数，所以在这里对选中的 K 个专家的权重做 softmax
+    // =============================================================================
     if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
         weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
         weights = ggml_soft_max(ctx0, weights); // [n_expert_used, n_tokens]
@@ -1495,52 +1582,79 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(weights, "ffn_moe_weights_softmax", il);
     }
 
+    // =============================================================================
+    // 步骤 10：权重归一化（可选）- 确保所有被选中专家的权重之和为 1
+    // 防止加权求和时数值过大或过小，提升数值稳定性
+    // =============================================================================
     if (norm_w) {
         weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
 
+        // 计算每行（每个 token）的权重之和
         ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights); // [1, n_tokens]
         cb(weights_sum, "ffn_moe_weights_sum", il);
 
-        // Avoid division by zero, clamp to smallest number representable by F16
+        // 防止除以零：将权重和限制在 F16 能表示的最小正数以上
+        // F16 最小正数约为 6.103515625e-5
         weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
         cb(weights_sum, "ffn_moe_weights_sum_clamped", il);
 
+        // 归一化：每个权重除以该 token 的权重总和
         weights = ggml_div(ctx0, weights, weights_sum); // [n_expert_used, n_tokens]
         cb(weights, "ffn_moe_weights_norm", il);
 
         weights = ggml_reshape_3d(ctx0, weights, 1, n_expert_used, n_tokens);
     }
+
+    // 可选：应用额外的全局权重缩放因子
     if (w_scale != 0.0f && w_scale != 1.0f) {
         weights = ggml_scale(ctx0, weights, w_scale);
         cb(weights, "ffn_moe_weights_scaled", il);
     }
 
-    //call early so that topk-moe can be used
+    // 提前将 weights 加入计算图，使 topk-moe 优化路径可用
     ggml_build_forward_expand(gf, weights);
 
+    // 将 cur 从 [n_tokens, n_embd] 变形为 [n_embd, 1, n_tokens]
     cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
 
+    // =============================================================================
+    // 步骤 11：Llama4 特殊处理 - 在 FFN 计算之前应用权重
+    // 对于 Llama4，将权重直接乘到输入 hidden states 上，再送入 FFN 计算
+    // =============================================================================
     if (weight_before_ffn) {
-        // repeat cur to [n_embd, n_expert_used, n_tokens]
+        // 将 cur 重复扩展到 [n_embd, n_expert_used, n_tokens] 以匹配 weights 维度
         ggml_tensor * repeated = ggml_repeat_4d(ctx0, cur, n_embd, n_expert_used, n_tokens, 1);
+        // 权重乘以 hidden states：cur[i] = cur[i] * weights[i]
         cur = ggml_mul(ctx0, repeated, weights);
         cb(cur, "ffn_moe_weighted", il);
     }
 
+    // =============================================================================
+    // 步骤 12：FFN 专家计算 - 根据选中的专家索引取出对应权重并执行 FFN
+    // up / gate / down 三层投影构成每个专家的 FFN
+    // =============================================================================
     ggml_tensor * up = nullptr;
     ggml_tensor * experts = nullptr;
 
+    // =============================================================================
+    // 路径 A：融合 Gate+Up 投影（merged gate_up path）
+    // 优点：一次矩阵乘法同时完成 gate 和 up 投影，减少内存访问
+    // =============================================================================
     if (gate_up_exps) {
-        // merged gate_up path: one mul_mat_id, then split into gate and up views
+        // build_lora_mm_id 执行带索引的矩阵乘法：
+        // cur [n_embd, 1, n_tokens] @ gate_up_exps.T [n_expert, n_ff*2, n_embd]
+        // 根据 selected_experts 索引，只取出被选中专家的权重进行计算
+        // 结果形状 [n_ff*2, n_expert_used, n_tokens]
         ggml_tensor * gate_up = build_lora_mm_id(gate_up_exps, cur, selected_experts); // [n_ff*2, n_expert_used, n_tokens]
         cb(gate_up, "ffn_moe_gate_up", il);
 
+        // 可选：添加融合投影的偏置
         if (gate_up_exps_b) {
             gate_up = ggml_add_id(ctx0, gate_up, gate_up_exps_b, selected_experts);
             cb(gate_up, "ffn_moe_gate_up_biased", il);
         }
 
-        // apply per-expert scale2 to merged gate_up (use up_exps_s since gate and up are fused)
+        // 可选：对融合的 gate_up 应用 per-expert 缩放因子
         if (up_exps_s) {
             ggml_tensor * s = ggml_reshape_3d(ctx0, up_exps_s, 1, n_expert, 1);
             s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
@@ -1549,22 +1663,31 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cb(gate_up, "ffn_moe_gate_up_scaled", il);
         }
 
+        // 将融合的 gate_up 拆分为 gate 部分和 up 部分
+        // gate_up 形状 [n_ff*2, n_expert_used, n_tokens]，前半是 gate，后半是 up
         const int64_t n_ff = gate_up->ne[0] / 2;
+        // cur 指向 gate 部分（前半 [n_ff, n_expert_used, n_tokens]）
         cur = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
         cb(cur, "ffn_moe_gate", il);
+        // up 指向 up 部分（后半 [n_ff, n_expert_used, n_tokens]）
         up  = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], n_ff * gate_up->nb[0]);
         cb(up, "ffn_moe_up", il);
     } else {
-        // separate gate and up path
+        // =============================================================================
+        // 路径 B：分离的 Gate 和 Up 投影（separate gate and up path）
+        // 分别执行 gate 和 up 的矩阵乘法
+        // =============================================================================
+        // up 投影：cur @ up_exps.T -> up [n_ff, n_expert_used, n_tokens]
         up = build_lora_mm_id(up_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
         cb(up, "ffn_moe_up", il);
 
+        // 可选：添加 up 投影的 per-expert 偏置
         if (up_exps_b) {
             up = ggml_add_id(ctx0, up, up_exps_b, selected_experts);
             cb(up, "ffn_moe_up_biased", il);
         }
 
-        // apply per-expert scale2 to up
+        // 可选：对 up 应用 per-expert 缩放因子
         if (up_exps_s) {
             ggml_tensor * s = ggml_reshape_3d(ctx0, up_exps_s, 1, n_expert, 1);
             s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
@@ -1573,19 +1696,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             cb(up, "ffn_moe_up_scaled", il);
         }
 
+        // gate 投影：如果存在独立的 gate_exps 权重，执行 gate 投影
         if (gate_exps) {
             cur = build_lora_mm_id(gate_exps, cur, selected_experts); // [n_ff, n_expert_used, n_tokens]
             cb(cur, "ffn_moe_gate", il);
         } else {
+            // 如果没有独立的 gate，使用 up 作为 gate（简单激活模式）
             cur = up;
         }
 
+        // 可选：添加 gate 投影的 per-expert 偏置
         if (gate_exps_b) {
             cur = ggml_add_id(ctx0, cur, gate_exps_b, selected_experts);
             cb(cur, "ffn_moe_gate_biased", il);
         }
 
-        // apply per-expert scale2 to gate
+        // 可选：对 gate 应用 per-expert 缩放因子
         if (gate_exps_s) {
             ggml_tensor * s = ggml_reshape_3d(ctx0, gate_exps_s, 1, n_expert, 1);
             s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
@@ -1595,24 +1721,34 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         }
     }
 
+    // 判断是否存在 gate 分支（用于选择激活函数类型）
     const bool has_gate = gate_exps || gate_up_exps;
 
+    // =============================================================================
+    // 步骤 13：激活函数 - 根据 FFN 类型应用不同的激活函数
+    // =============================================================================
     switch (type_op) {
+        // SILU / SwiGLU：SiLU (Swish Linear Unit) 激活
         case LLM_FFN_SILU:
+            // 如果存在 gate 分支，使用 SwiGLU 变体（gate * up * silu(gate)）
             if (gate_exps) {
-                // Step35: per-layer clamp for routed experts
+                // Step35 架构特殊处理：对 gate 激活值做逐层钳制（clamp）
+                // 用于限制路由专家的激活范围，防止数值溢出
                 if (arch == LLM_ARCH_STEP35 && il >= 0) {
                     const float limit = hparams.swiglu_clamp_exp[il];
                     constexpr float eps = 1e-6f;
                     if (limit > eps) {
+                        // 对 gate 应用 SILU 激活后钳制到 [−∞, limit]
                         ggml_tensor * gate_act = ggml_silu(ctx0, cur);
                         cb(gate_act, "ffn_moe_silu", il);
                         gate_act = ggml_clamp(ctx0, gate_act, -INFINITY, limit);
                         cb(gate_act, "ffn_moe_silu_clamped", il);
 
+                        // 对 up 也钳制到 [−limit, limit]
                         up = ggml_clamp(ctx0, up, -limit, limit);
                         cb(up, "ffn_moe_up_clamped", il);
 
+                        // gate_act * up
                         cur = ggml_mul(ctx0, gate_act, up);
                         cb(cur, "ffn_moe_swiglu_limited", il);
                         break;
@@ -1621,39 +1757,47 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
 
             if (has_gate) {
+                // SwiGLU split：cur = silu(gate) * up（gate 和 up 分别传入）
                 cur = ggml_swiglu_split(ctx0, cur, up);
                 cb(cur, "ffn_moe_swiglu", il);
             } else {
+                // 简单 SILU：cur = silu(cur)
                 cur = ggml_silu(ctx0, cur);
                 cb(cur, "ffn_moe_silu", il);
             } break;
+        // GELU / GeGLU：高斯误差线性单元
         case LLM_FFN_GELU:
             if (has_gate) {
+                // GeGLU split：cur = gelu(gate) * up
                 cur = ggml_geglu_split(ctx0, cur, up);
                 cb(cur, "ffn_moe_geglu", il);
             } else {
                 cur = ggml_gelu(ctx0, cur);
                 cb(cur, "ffn_moe_gelu", il);
             } break;
+        // SwiGLU OAI：OpenAI 风格的 SwiGLU（带有固定 alpha 和 limit 参数）
         case LLM_FFN_SWIGLU_OAI_MOE:
             {
-                // TODO: move to hparams?
+                // alpha = 1.702 (Swish 的 beta 参数), limit = 7.0（激活值上限）
                 constexpr float alpha = 1.702f;
                 constexpr float limit = 7.0f;
                 cur = ggml_swiglu_oai(ctx0, cur, up, alpha, limit);
                 cb(cur, "ffn_moe_swiglu_oai", il);
             } break;
+        // ReLU / ReGLU：线性整流单元
         case LLM_FFN_RELU:
             if (has_gate) {
+                // ReGLU split：cur = relu(gate) * up
                 cur = ggml_reglu_split(ctx0, cur, up);
                 cb(cur, "ffn_moe_reglu", il);
             } else {
                 cur = ggml_relu(ctx0, cur);
                 cb(cur, "ffn_moe_relu", il);
             } break;
+        // ReLU Squared：relu(x)^2
         case LLM_FFN_RELU_SQR:
             if (has_gate) {
-                // TODO: add support for gated squared relu
+                // gated squared relu 尚未实现
                 GGML_ABORT("fatal error: gated squared relu not implemented");
             } else {
                 cur = ggml_relu(ctx0, cur);
@@ -1664,15 +1808,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             GGML_ABORT("fatal error");
     }
 
+    // =============================================================================
+    // 步骤 14：Down 投影 - FFN 的最后一级，将中间维度映射回隐藏维度
+    // cur [n_ff, n_expert_used, n_tokens] @ down_exps.T [n_expert, n_embd, n_ff]
+    // =============================================================================
     experts = build_lora_mm_id(down_exps, cur, selected_experts); // [n_embd, n_expert_used, n_tokens]
     cb(experts, "ffn_moe_down", il);
 
+    // 可选：添加 down 投影的 per-expert 偏置
     if (down_exps_b) {
         experts = ggml_add_id(ctx0, experts, down_exps_b, selected_experts);
         cb(experts, "ffn_moe_down_biased", il);
     }
 
-    // apply per-expert scale2 to down
+    // 可选：对 down 应用 per-expert 缩放因子
     if (down_exps_s) {
         ggml_tensor * s = ggml_reshape_3d(ctx0, down_exps_s, 1, n_expert, 1);
         s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
@@ -1681,43 +1830,63 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(experts, "ffn_moe_down_scaled", il);
     }
 
+    // =============================================================================
+    // 步骤 15：应用专家权重（加权）
+    // 如果是 Llama4（weight_before_ffn = true），权重已在步骤 11 中提前应用到输入
+    // 对于其他架构，在这里将 down 投影的结果与专家权重相乘
+    // =============================================================================
     if (!weight_before_ffn) {
+        // experts [n_embd, n_expert_used, n_tokens] * weights [1, n_expert_used, n_tokens]
+        // 广播乘法：每个 token 的每个专家输出乘以对应的路由权重
         experts = ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
     }
 
+    // 将 experts 加入计算图
     ggml_build_forward_expand(gf, experts);
 
+    // =============================================================================
+    // 步骤 16：聚合专家输出 - 将多个被选中专家的 FFN 结果加权求和
+    // 每个专家的输出维度为 [n_embd, n_tokens]，按索引方向堆叠在 experts 张量中
+    // =============================================================================
     ggml_tensor * cur_experts[LLAMA_MAX_EXPERTS] = { nullptr };
 
     assert(n_expert_used > 0);
 
-    // order the views before the adds
+    // 在加法操作之前预先创建视图（view），避免计算图过度展开
+    // cur_experts[i] 指向 experts 中第 i 个专家的输出区域
     for (uint32_t i = 0; i < hparams.n_expert_used; ++i) {
         cur_experts[i] = ggml_view_2d(ctx0, experts, n_embd, n_tokens, experts->nb[2], i*experts->nb[1]);
 
         ggml_build_forward_expand(gf, cur_experts[i]);
     }
 
-    // aggregate experts
-    // note: here we explicitly use hparams.n_expert_used instead of n_expert_used
-    //       to avoid potentially a large number of add nodes during warmup
-    //       ref: https://github.com/ggml-org/llama.cpp/pull/14753
-    ggml_tensor * moe_out = cur_experts[0];
+    // =============================================================================
+    // 步骤 17：累加所有专家的输出
+    // 使用显式的 hparams.n_expert_used 而非 n_expert_used，
+    // 以避免在模型预热（warmup）阶段产生大量加法节点导致计算图过大
+    // 参考: https://github.com/ggml-org/llama.cpp/pull/14753
+    // =============================================================================
+    ggml_tensor * moe_out = cur_experts[0]; // 从第一个专家开始
 
     for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
+        // 依次将每个专家的输出加到累计结果上
         moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
 
         ggml_build_forward_expand(gf, moe_out);
     }
 
+    // 如果只使用了一个专家（n_expert_used == 1），确保返回的是连续（contiguous）张量
     if (hparams.n_expert_used == 1) {
-        // avoid returning a non-contiguous tensor
         moe_out = ggml_cont(ctx0, moe_out);
     }
 
     cb(moe_out, "ffn_moe_out", il);
 
+    // =============================================================================
+    // 步骤 18：返回 MoE FFN 的最终输出
+    // 形状 [n_tokens, n_embd]，与输入 cur 的形状相同
+    // =============================================================================
     return moe_out;
 }
 

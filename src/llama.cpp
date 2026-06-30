@@ -462,17 +462,29 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
 
 /**
  * llama_model_load_from_file_impl
- * model load from file implementation (从文件加载模型的实现)
+ * 模型加载实现的内部入口（对外 API llama_model_load_from_file / _ptr / _splits 都会汇聚到这里）
  *
- * metadata: GGUF 元数据 (可选)
- * set_tensor_data: 设置张量数据的回调
- * set_tensor_data_ud: set_tensor_data 的 user data
- * path_model: 模型文件路径
- * splits: 分片路径列表
- * file: 已打开的文件指针 (可选)
- * params: model parameters (模型参数)
+ * 该函数是 llama.cpp 中"加载模型"的统一实现，承接三种可能的输入来源:
+ *   - metadata       : 已解析好的 gguf 元数据上下文（一般来自 llama_model_load_from_buffer）
+ *   - path_model     : 模型文件路径（文件路径 / 拆分文件第 0 个；支持 ".gguf" 单文件或 split.gguf-N 等分片）
+ *   - file           : 已打开的 FILE* 句柄（一般来自 llama_model_load_from_file_ptr 之类指针形式 API）
  *
- * 注意: metadata / path_model / file 三者必须恰好有一个被指定
+ * 设计原则:
+ *   - 这三个来源必须**有且仅有一个**，避免出现"既给路径又给 fd"这种语义歧义；
+ *     任何"零或多于一个"都被视为参数错误并直接返回 nullptr。
+ *   - 该函数本身不做实际解码，而是再委托给 llama_model_load() 真正的实现，
+ *     这里只负责统一的预处理：参数校验 / backend 状态检查 / 进度回调的默认注入 /
+ *     错误返回码 (status) 转译为 std::nullptr_t。
+ *
+ * metadata               : 可选，已解析好的 gguf 元数据；为 nullptr 时表示"用路径或 fd 重新解析"。
+ * set_tensor_data        : 张量数据回调，由调用方（file / buffer 等场景）注入；解析到分片时使用。
+ * set_tensor_data_ud     : set_tensor_data 的用户自定义数据透传。
+ * path_model             : 模型文件路径；可选；与 metadata / file 三选一。
+ * splits                 : 拆分文件列表（split.gguf / split.gguf-N），按需追加。
+ * file                   : 已打开的 FILE*；可选；与 metadata / path_model 三选一。
+ * params                 : 模型加载参数（设备列表、进度回调、是否仅取词表 vocab_only 等）。
+ *
+ * 返回: 成功返回指向内部已分配 llama_model 的指针；失败返回 nullptr。失败原因已写日志。
  */
 static struct llama_model * llama_model_load_from_file_impl(
         struct gguf_context * metadata,
@@ -483,6 +495,8 @@ static struct llama_model * llama_model_load_from_file_impl(
         FILE * file,
         struct llama_model_params params) {
     {
+        // 参数互斥校验：metadata / path_model / file 三者必须"恰好一个有值"
+        // 例如同时传 path_model 和 file 就会落入此分支直接报错，避免后续歧义解析。
         int n_sources_defined = 0;
         if (metadata != nullptr) {
             n_sources_defined++;
@@ -498,13 +512,19 @@ static struct llama_model * llama_model_load_from_file_impl(
             return nullptr;
         }
     }
+    // ggml 时间相关基础设施初始化（带 wall-clock、perf_counter 等），后续打点/进度都依赖它
     ggml_time_init();
 
+    // 后端检查：若调用方不是只要 vocab，就必须先至少加载一个 ggml backend
+    // （CPU / CUDA / Vulkan 等），否则张量无法实际分配，模型加载毫无意义。
     if (!params.vocab_only && ggml_backend_reg_count() == 0) {
         LLAMA_LOG_ERROR("%s: no backends are loaded. hint: use ggml_backend_load() or ggml_backend_load_all() to load a backend before calling this function\n", __func__);
         return nullptr;
     }
 
+    // 默认进度回调：如果调用方没传 progress_callback，就临时塞一个简易的"打点进度条"
+    // 行为：每次进度百分比推进就多打一个 '.'，到 100% 时换行。打印频率由 user_data 控制，
+    // 这里用一个栈上的计数器 cur_percentage 来记住上一次打印到的百分比，避免重复打点。
     unsigned cur_percentage = 0;
     if (params.progress_callback == NULL) {
         params.progress_callback_user_data = &cur_percentage;
@@ -522,15 +542,23 @@ static struct llama_model * llama_model_load_from_file_impl(
         };
     }
 
+    // 调用真正的实现 llama_model_load()，拿到带状态码 (status) 的结果。
+    // 返回约定:
+    //   status >  0 : 加载被取消 (如 progress_callback 返回 false)，此时 model 可能非空
+    //   status == 0 : 成功
+    //   status <  0 : 失败 (-1 普通失败, -2 被取消)
     const auto [status, model] = llama_model_load(metadata, set_tensor_data, set_tensor_data_ud, path_model, splits, file, params);
     GGML_ASSERT(status <= 0);
     if (status < 0) {
+        // 根据 status 区分失败原因，写入更可读的日志
         if (status == -1) {
             LLAMA_LOG_ERROR("%s: failed to load model\n", __func__);
         } else if (status == -2) {
             LLAMA_LOG_INFO("%s: cancelled model load\n", __func__);
         }
 
+        // llama_model_load 在失败路径下也可能已经分配了一部分 model（成功建好 vocab 等），
+        // 必须显式释放避免泄漏；释放后再返回 nullptr。
         if (model) {
             llama_model_free(model);
         }

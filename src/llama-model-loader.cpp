@@ -1,3 +1,21 @@
+// ============================================================================
+//  llama-model-loader.cpp - GGUF model loader
+//
+//  This file is the single source of truth for how llama.cpp turns a GGUF
+//  file (or a set of split GGUF shards) into:
+//    * a typed view of its metadata (hparams, tokenizer config, ...), and
+//    * a set of ggml_tensor objects whose `data` either points into an mmap
+//      of the file or has been streamed into a backend buffer.
+//
+//  Top-level flow:
+//    1. Constructor   - open GGUF, parse KV pairs, build `weights_map`
+//                        (tensor name -> {file, offset, dtype, shape}).
+//    2. create_tensor - per architecture, allocate ggml_tensor entries in
+//                        the right backend buffer (CPU / GPU / NPU).
+//    3. load_all_data - bulk-stream tensor bytes into the buffers chosen
+//                        in step 2, with optional mmap / async GPU upload.
+// ============================================================================
+
 #include "llama-model-loader.h"
 
 #include "ggml-alloc.h"
@@ -100,7 +118,24 @@ static std::vector<std::string> llama_get_list_splits(const std::string & path, 
     return paths;
 }
 
+// ============================================================================
+//  GGUFMeta - a thin, type-safe wrapper around gguf_get_val_*(ctx, kid).
+//
+//  Why it exists:
+//    GGUF stores every metadata entry with a runtime `gguf_type` tag, but the
+//    caller (e.g. llm_arch_hparams::read) statically knows the C++ type it
+//    expects. Without this layer every reader would have to:
+//      - find the key by string,
+//      - check the runtime type matches,
+//      - cast to the right getter,
+//      - then convert to the target type.
+//    GKV<T> collapses that into a single `GKV<T>::get_kv(ctx, k)` call and
+//    throws on a type mismatch - turning what would be 30 lines of paranoid
+//    boilerplate per metadata field into one line.
+// ============================================================================
 namespace GGUFMeta {
+    // Primary template binds each C++ type to (gguf_type tag, getter fn).
+    // Specializations below cover every scalar / string type GGUF can store.
     template <typename T, gguf_type gt_, T (*gfun)(const gguf_context *, const int64_t)>
     struct GKV_Base_Type {
         static constexpr gguf_type gt = gt_;
@@ -248,14 +283,19 @@ namespace GGUFMeta {
             return false;
         }
 
-        static bool set(const gguf_context * ctx, const int k, T & target, const struct llama_model_kv_override * ovrd = nullptr) {
-            if (try_override<T>(target, ovrd)) {
-                return true;
-            }
-            if (k < 0) { return false; }
-            target = get_kv(ctx, k);
+// The "front door" the rest of llama.cpp uses to read a metadata value.
+    // 1. If the user passed a kv_override (e.g. --override "rope.freq_base=..."),
+    //    validate the override type and apply it.
+    // 2. Otherwise look the key up in the GGUF and decode it, throwing if the
+    //    runtime type doesn't match the compile-time type T.
+    static bool set(const gguf_context * ctx, const int k, T & target, const struct llama_model_kv_override * ovrd = nullptr) {
+        if (try_override<T>(target, ovrd)) {
             return true;
         }
+        if (k < 0) { return false; }
+        target = get_kv(ctx, k);
+        return true;
+    }
 
         static bool set(const gguf_context * ctx, const char * key, T & target, const struct llama_model_kv_override * ovrd = nullptr) {
             return set(ctx, gguf_find_key(ctx, key), target, ovrd);
@@ -394,6 +434,11 @@ namespace GGUFMeta {
 
     template bool llama_model_loader::get_arr<std::vector<std::string>>(enum llm_kv kid, std::vector<std::string> & result, bool required);
 
+    // The model-side wrapper that first consults the kv_overrides map (filled by
+    // the constructor from CLI `--override` flags), then delegates to GGUFMeta
+    // for the actual GGUF read. This is the function every hparams/arch reader
+    // calls - it's the single place where "user override" and "file metadata"
+    // are merged.
     template<typename T>
     bool llama_model_loader::get_key(const std::string & key, T & result, bool required) {
         auto it = kv_overrides.find(key);
@@ -433,6 +478,11 @@ namespace GGUFMeta {
     }
 
     // get array of n <= N_MAX elements, or a single element repeated n times
+    // Several archs store the same value in two equivalent ways: either as a
+    // scalar (e.g. rope.freq_base=10000.0) or as a per-layer array (one entry
+    // per head). This helper hides that polymorphism - the caller passes the
+    // expected length `n`, and we either copy `n` array entries or broadcast
+    // the scalar `n` times.
     template<typename T, size_t N_MAX>
     bool llama_model_loader::get_key_or_arr(const std::string & key, std::array<T, N_MAX> & result, uint32_t n, bool required) {
         const int kid = gguf_find_key(metadata, key.c_str());
@@ -507,6 +557,32 @@ namespace GGUFMeta {
     template bool llama_model_loader::get_key_or_arr<std::array<float, 512>>(enum llm_kv kid, std::array<float, 512> & result, uint32_t n, bool required);
 
 
+// ============================================================================
+//  llama_model_loader constructor
+//
+//  Three entry modes (chosen by caller-supplied args):
+//    A) fname != ""             - normal path: open main GGUF (+ optional shards).
+//    B) file  != nullptr        - "in-memory" mode: GGUF is already in a FILE*.
+//    C) both empty              - metadata-only mode: hparams/tokenizer only,
+//                                 weights will be supplied by a sibling loader
+//                                 (used by split-experts / multi-model .gguf).
+//
+//  Responsibilities, in order:
+//    1. Snapshot the user's kv_overrides into a hashmap for fast lookup.
+//    2. Call gguf_init_from_file{,ptr} - this is where the GGUF header, KV
+//       table and tensor index are parsed. `no_alloc=true` because we don't
+//       want ggml to copy any tensor bytes yet.
+//    3. Detect architecture from LLM_KV_GENERAL_ARCHITECTURE (e.g. "llama",
+//       "qwen2", "mamba") and instantiate the matching KV-namespace table.
+//    4. Walk every ggml_tensor in the main file and record its (file, offset,
+//       dtype) into weights_map. This map is the single index used later by
+//       create_tensor / load_all_data - it's the bridge between "what the
+//       file says" and "what the model graph wants".
+//    5. If n_split > 1, repeat step 4 for every shard, sanity-checking the
+//       split.index metadata.
+//    6. Print KV dump + tensor type histogram, and *guess* the file's
+//       quantization (ftype) from the dominant ggml_type.
+// ============================================================================
 llama_model_loader::llama_model_loader(
         struct gguf_context * meta,
         llama_model_set_tensor_data_t set_tensor_data,
@@ -571,6 +647,10 @@ llama_model_loader::llama_model_loader(
         // Save tensors data offset of the main file.
         // For subsidiary files, `meta` tensor data offset must not be used,
         // so we build a unified tensors index for weights.
+        // Walk every tensor declared in the GGUF header and remember where
+        // its raw bytes live. The duplicate-name check guards against
+        // malformed files; weights_map is the single index every later step
+        // (create_tensor, load_all_data) queries by tensor name.
         for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
             std::string tensor_name = std::string(cur->name);
             // make sure there is no duplicated tensor names
@@ -585,6 +665,11 @@ llama_model_loader::llama_model_loader(
         get_key(llm_kv(LLM_KV_SPLIT_COUNT), n_split, false);
 
         // Load additional GGML contexts
+        // For sharded models (>1 GGUF), each split file carries its own gguf_context
+        // and its own ggml_context. We add them to `files` and `contexts` in
+        // order and merge their tensors into the unified weights_map. The
+        // tensor offset recorded in llama_tensor_weight is per-file, so the
+        // sharded file index is stored alongside it (`idx`).
         if (n_split > 1) {
             // make sure the main file is loaded first
             uint16_t idx = 0;
@@ -637,16 +722,19 @@ llama_model_loader::llama_model_loader(
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
-                for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
-                    std::string tensor_name = std::string(cur->name);
-                    // make sure there is no duplicated tensor names
-                    if (weights_map.find(tensor_name) != weights_map.end()) {
-                        throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
-                    }
-                    n_elements += ggml_nelements(cur);
-                    n_bytes    += ggml_nbytes(cur);
-                    weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
+// Walk tensors again for every shard. Same duplicate check + bookkeeping
+            // as the main file, but each entry now carries `idx = shard id` so
+            // load_all_data knows which file/offset to seek to.
+            for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+                std::string tensor_name = std::string(cur->name);
+                // make sure there is no duplicated tensor names
+                if (weights_map.find(tensor_name) != weights_map.end()) {
+                    throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));
                 }
+                n_elements += ggml_nelements(cur);
+                n_bytes    += ggml_nbytes(cur);
+                weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, ctx_gguf.get(), cur));
+            }
             }
 
             get_key(llm_kv(LLM_KV_SPLIT_TENSORS_COUNT), n_tensors);
@@ -706,8 +794,12 @@ llama_model_loader::llama_model_loader(
 
     // determine file type based on the number of tensors for each quantization and print meta data
     // TODO: make optional
-    {
-        std::map<enum ggml_type, uint32_t> n_type;
+    // Build a histogram of ggml_types across all tensors so we can print a
+        // summary, then *guess* the model's quantization by taking the most
+        // common type. This is just a hint - if the file's metadata advertises
+        // general.file_type, that value wins below.
+        {
+            std::map<enum ggml_type, uint32_t> n_type;
 
         uint32_t n_type_max = 0;
         enum ggml_type type_max = GGML_TYPE_F32;
@@ -770,6 +862,9 @@ llama_model_loader::llama_model_loader(
         // this is a way to mark that we have "guessed" the file type
         ftype = (llama_ftype) (ftype | LLAMA_FTYPE_GUESSED);
 
+        // Authoritative file type: if the GGUF declares general.file_type, trust
+        // it and discard the guess. This matters because the dominant-type
+        // heuristic can't distinguish Q4_K_S from Q4_K_M (same ggml_type).
         {
             uint32_t ftype_val = 0;
             if (get_key(LLM_KV_GENERAL_FILE_TYPE, ftype_val, false)) {
@@ -826,7 +921,12 @@ enum llm_arch llama_model_loader::get_arch() const {
     return llm_kv.arch;
 }
 
-const llama_model_loader::llama_tensor_weight * llama_model_loader::get_weight(const char * name) const {
+// Lookup helper used everywhere downstream. Two variants:
+    //   get_weight / get_tensor_meta     - return nullptr if missing (caller decides).
+    //   require_weight / require_tensor_meta - throw if missing (for tensors the
+    //                                          architecture assumes must exist).
+    // Splitting them avoids try/catch noise at every call site.
+    const llama_model_loader::llama_tensor_weight * llama_model_loader::get_weight(const char * name) const {
     auto pos = weights_map.find(name);
     if (pos != weights_map.end()) {
         return &pos->second;
@@ -889,7 +989,22 @@ const struct ggml_tensor * llama_model_loader::check_tensor_dims(const std::stri
     return cur;
 }
 
-// checks if the weight tensor can be used with the specified buffer type and device
+// ============================================================================
+//  weight_buft_supported - "Can this tensor, paired with this op, be
+//  executed on this device/buffer?"
+//
+//  Heterogeneous inference (CPU + iGPU + dGPU + NPU) means there is no
+//  universal "best" buffer. Each ggml_op has different requirements:
+//    * GGML_OP_MUL_MAT  needs fast SGEMM/QGEMM kernels  -> prefers GPU
+//    * GGML_OP_ADD      for biases                       -> trivial on CPU
+//    * GGML_OP_SSM_SCAN (Mamba)                          -> CPU or special accel
+//  We probe by *constructing a tiny dummy graph* with the real weight's
+//  dtype/shape and asking the backend's supports_op(). A 0-byte buffer is
+//  temporarily hung off the weight just so supports_op sees a buffer type.
+//
+//  This is intentionally conservative: if the probe says "no", we fall back
+//  to the next buffer in the user's priority list (see select_weight_buft).
+// ============================================================================
 static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w, ggml_op op, ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev) {
     GGML_ASSERT(w != nullptr);
 
@@ -1029,7 +1144,11 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
 }
 
 // find the first buffer type in the list that can use the tensor
-static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t * buft_list) {
+// Pick the *first* buffer type in the candidate list that supports the
+    // tensor's intended op. The candidate list is supplied by the model code
+    // (typically: [device 0, device 1, ..., CPU]) and respects the
+    // --tensor-split / --main-gpu / -ngl flags the user passed.
+    static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hparams, ggml_tensor * tensor, ggml_op op, const buft_list_t * buft_list) {
     GGML_ASSERT(!buft_list->empty());
     for (const auto & cur : *buft_list) {
         ggml_backend_dev_t cur_dev = cur.first;
@@ -1042,6 +1161,28 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
     return nullptr;
 }
 
+// ============================================================================
+//  create_tensor - the bridge between "tensor the model graph wants" and
+//  "buffer the backend can store it in".
+//
+//  Per-tensor decisions made here:
+//    * Skip unused tensors (info.op == GGML_OP_NONE) and account for their
+//      bytes in size_data so progress reporting stays accurate.
+//    * Promote GGML_OP_ADD/ADD_ID when the tensor name ends in "bias" -
+//      llm_tensor_info records the *base* op but biases are always addends.
+//    * Decide which candidate buffer list to query:
+//         LLM_TENSOR_LAYER_INPUT    -> buft_list_input
+//         LLM_TENSOR_LAYER_OUTPUT   -> buft_list_output
+//         LLM_TENSOR_LAYER_REPEATING-> buft_list_layer
+//      (e.g. the embedding can sit on CPU while every transformer block
+//       lives on GPU - this list-of-lists encoding is how that works.)
+//    * Honour user overrides (--tensor-<name>-buffer-type) before falling
+//      back to select_weight_buft. The "override-to-CPU" branch also
+//      reflows the data away from the host buffer so mmap'd weights can
+//      still be uploaded to GPU on demand.
+//    * Track every tensor that ends up on a non-default buffer so the final
+//      done_getting_tensors() log can warn the user.
+// ============================================================================
 struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
@@ -1086,6 +1227,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         // some models use the token embedding tensor as the output, but since these are used in different layers and with different ops
         // the tensor is duplicated
         // to handle this, we check if the tensor is duplicated, and if so, we assume that it is being loaded as the output tensor
+        // Some archs share the token embedding matrix as the output projection
+        // (weight tying). Since the two roles have different op-kernels,
+        // we mark the second one TENSOR_DUPLICATED and reclassify it as
+        // the OUTPUT tensor so select_weight_buft picks a buffer that
+        // supports GGML_OP_MUL_MAT (used by the LM head).
         llm_tensor tn_tensor = tn.tensor;
         if (tn.tensor == LLM_TENSOR_TOKEN_EMBD && (flags & TENSOR_DUPLICATED)) {
             tn_tensor = LLM_TENSOR_OUTPUT;
@@ -1153,6 +1299,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_backend_buffer_type_t buft = nullptr;
 
         // check overrides
+        // Per-user override of the buffer type. Patterns are regex-matched against
+        // the tensor name, so `--override-tensor "ffn_.*_exps=CPU"` style
+        // flags work. Overriding to the CPU buffer type is special-cased:
+        // it falls back to the heterogeneous CPU buft list rather than
+        // blindly picking the system CPU buffer, so NUMA-aware splits still
+        // get a chance.
         if (tensor_buft_overrides) {
             std::string tensor_name = tn.str();
             for (const auto * overrides = tensor_buft_overrides; overrides->pattern != nullptr; ++overrides) {
@@ -1312,7 +1464,16 @@ struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_conte
     return tensor;
 }
 
-void llama_model_loader::done_getting_tensors(bool partial) const {
+// Final sanity check called by llm_arch_hparams::create_tensors after every
+    // tensor the architecture wanted has been requested. It catches three
+    // classes of bug:
+    //   * The arch asked for too many tensors (typo in a tensor name).
+    //   * The arch forgot to ask for a tensor (partial=true means "ok, this
+    //     .gguf is one of several bundled models sharing the file").
+    //   * Some tensor had to be moved to a fallback buffer (e.g. NPU can't
+    //     do GGML_OP_MUL_MAT_ID for some reason). We surface this so users
+    //     don't silently lose performance.
+    void llama_model_loader::done_getting_tensors(bool partial) const {
     if (n_created > n_tensors) {
         throw std::runtime_error(format("%s: too many tensors created; expected %d, got %d", __func__, n_tensors, n_created));
     }
@@ -1330,6 +1491,20 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
 }
 
+// ============================================================================
+//  init_mappings - memory-map every GGUF file (one llama_mmap per file).
+//
+//  mmap is the secret to llama.cpp's fast startup: instead of read()'ing the
+//  whole file into a malloc'd buffer and then memcpy()'ing into ggml tensors,
+//  we just let the kernel page in pages lazily as the GPU/CPU touches them.
+//  Two extra concerns:
+//    * NUMA: on multi-socket boxes we ask the CPU backend for an
+//      interleave-aware mmap so the first-touch policy puts pages on the
+//      socket that ends up using them.
+//    * mlock: if the user passed --mlock, we pin the pages so the model is
+//      never evicted to swap.
+//  size_data is summed here so load_all_data can compute accurate progress.
+// ============================================================================
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
     if (use_mmap) {
         mappings.reserve(files.size());
@@ -1380,7 +1555,13 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
     }
 }
 
-void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
+// Single-tensor fast path used when the architecture needs to lazily load
+    // a tensor (e.g. expert weights that are only touched conditionally).
+    // mmap mode: point tensor->data straight into the mmap region at `offs` -
+    // no copy. non-mmap mode: seek+read_raw into a pre-allocated buffer.
+    // check_tensors validates the data via ggml_validate_row_data which
+    // catches NaN/Inf/Q4 zero-block corruptions.
+    void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
     const auto & w = require_weight(ggml_get_name(cur));
 
     if (use_mmap) {
@@ -1403,6 +1584,37 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
     }
 }
 
+// ============================================================================
+//  load_all_data - the hot path for model loading.
+//
+//  Streams every tensor in dependency order into the buffer that
+//  create_tensor chose for it. Four execution strategies, picked per tensor:
+//
+//    1) mmap + backend supports the buffer type:
+//         Allocate the tensor inside the mmap'd region via
+//         ggml_backend_tensor_alloc - zero copies. Used for huge embedding
+//         matrices on GPU when the file is mmap'd.
+//
+//    2) mmap + backend does NOT support it (cross-device tensor):
+//         ggml_backend_tensor_set copies from the mmap region into the GPU
+//         buffer. The mmap is still useful because pages are faulted in
+//         once and shared across tensors.
+//
+//    3) read() into host buffer (CPU backend, no mmap):
+//         Trivial file->buffer copy.
+//
+//    4) async GPU upload (the interesting one):
+//         When the GPU backend supports host_buffer + async + events, we
+//         allocate `n_buffers` (4) pinned staging buffers and rotate them
+//         like a ring: read file -> wait on event -> record event ->
+//         upload -> next slot. This pipelines disk I/O with PCIe upload
+//         and is what makes loading a 70 GB model finish in seconds rather
+//         than minutes on a fast NVMe + dGPU box.
+//
+//  The async branch carefully aligns reads to the device's required
+//  alignment, trimming the alignment padding so only the true tensor
+//  bytes are copied to GPU.
+// ============================================================================
 bool llama_model_loader::load_all_data(
         struct ggml_context * ctx,
         llama_buf_map & bufs,
@@ -1533,13 +1745,17 @@ bool llama_model_loader::load_all_data(
 
         size_t n_size = ggml_nbytes(cur);
 
-        if (use_mmap) {
-            const auto & mapping = mappings.at(weight->idx);
-            ggml_backend_buffer_t buf_mmap = nullptr;
-            if (bufs.count(weight->idx)) {
-                buf_mmap = bufs.at(weight->idx);
-            }
-            uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
+// mmap path: if the backend that owns this tensor also owns the mmap'd
+            // buffer, we can back the tensor *directly* with the mmap address
+            // (zero-copy). Otherwise we copy from mmap into whatever buffer
+            // the backend prepared via ggml_backend_tensor_set.
+            if (use_mmap) {
+                const auto & mapping = mappings.at(weight->idx);
+                ggml_backend_buffer_t buf_mmap = nullptr;
+                if (bufs.count(weight->idx)) {
+                    buf_mmap = bufs.at(weight->idx);
+                }
+                uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
 
             if (check_tensors) {
                 validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
@@ -1574,7 +1790,12 @@ bool llama_model_loader::load_all_data(
                 }
             } else {
                 // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
-                if (upload_backend) {
+// Async upload path: read into a pinned host buffer, then kick off a
+                    // non-blocking DMA to GPU. The ring of `n_buffers` host
+                    // buffers + events lets us overlap disk I/O with PCIe
+                    // transfers - we don't wait for one tensor's upload to
+                    // finish before starting the next read.
+                    if (upload_backend) {
                     size_t offset = weight->offs;
                     alignment = file->read_alignment();
                     size_t aligned_offset = offset & ~(alignment - 1);
@@ -1626,15 +1847,19 @@ bool llama_model_loader::load_all_data(
                         ++buffer_idx;
                         buffer_idx %= n_buffers;
                     }
-                } else {
-                    read_buf.resize(n_size);
-                    file->seek(weight->offs, SEEK_SET);
-                    file->read_raw(read_buf.data(), n_size);
-                    ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
-                    if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
-                        throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                // Synchronous fallback path: read into a malloc'd buffer, then
+                    // ggml_backend_tensor_set copies it to the device.
+                    // Used when the backend can't do async uploads (most
+                    // integrated GPUs, NPU backends, etc.).
+                    } else {
+                        read_buf.resize(n_size);
+                        file->seek(weight->offs, SEEK_SET);
+                        file->read_raw(read_buf.data(), n_size);
+                        ggml_backend_tensor_set(cur, read_buf.data(), 0, n_size);
+                        if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), n_size)) {
+                            throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                        }
                     }
-                }
             }
         }
 
@@ -1665,9 +1890,15 @@ bool llama_model_loader::load_all_data(
     }
 
     // check if this is the last call and do final cleanup
-    if (size_done >= size_data) {
-        // unmap offloaded tensors and metadata
-        if (use_mmap) {
+    // After all tensors are loaded, unmap the *unused* portions of each file
+        // (the parts before the first tensor and after the last tensor in
+        // the file). On Linux this returns RAM to the page cache; on macOS
+        // it actually shrinks the process RSS. For a 70 GB model with the
+        // metadata at the head and a small KV-cache header at the tail,
+        // this routinely frees several hundred MB.
+        if (size_done >= size_data) {
+            // unmap offloaded tensors and metadata
+            if (use_mmap) {
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
                 const auto & mmap_used = mmaps_used.at(idx);
                 auto & mapping = mappings.at(idx);

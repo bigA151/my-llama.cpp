@@ -30,6 +30,16 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     throw std::runtime_error("Unsupported ctx type");
 }
 
+//
+// llama_context 构造器
+// -----------------------------------------------------------------------------
+// 职责：为已加载的 model 准备完整的推理运行时环境。
+// 主要工作：
+//   1. 把用户传入的 params 与模型超参数 hparams 合并成 cparams（上下文参数）
+//   2. 解析 RoPE 缩放、YaRN、Flash Attention、Fused Gated Delta Net 等高级选项
+//   3. 初始化多后端（GPU / ACCEL / CPU）、KV 内存模块、计算图调度器
+//   4. 预分配"最坏情况"计算图所需的 buffer，确保首次 decode 不会触发 realloc
+// -----------------------------------------------------------------------------
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -37,20 +47,26 @@ llama_context::llama_context(
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
-    // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
-    //     may need to be backend-dependent
+    // 上下文大小若不是 2 的幂，在某些后端上可能效率不佳；这里仅留 TODO 暂不强制。
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
 
+    // 把模型加载阶段的时间戳传过来，便于 perf 统计覆盖整个加载+推理生命周期。
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
 
     const auto & hparams = model.hparams;
 
+    // =========================================================================
+    // 合并用户参数与模型默认参数（约定：0 / 负数 / 未指定时回退到 hparams）
+    // =========================================================================
+
+    // n_seq_max：用户允许的最大并行序列数，下限为 1，上限为编译期 LLAMA_MAX_SEQ。
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
     }
 
+    // n_rs_seq：recurrent 状态部分回滚步长，仅支持该特性的架构（RWKV/Mamba 等）。
     cparams.n_rs_seq = params.n_rs_seq;
     if (cparams.n_rs_seq > 0 && !llm_arch_supports_rs_rollback(model.arch)) {
         LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model arch does not support recurrent partial rollback; clamping to 0\n",
@@ -60,6 +76,7 @@ llama_context::llama_context(
 
     cparams.n_threads        = params.n_threads;
     cparams.n_threads_batch  = params.n_threads_batch;
+    // YaRN 参数：负值表示"使用模型默认值"。
     cparams.yarn_ext_factor  = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor;
     cparams.yarn_attn_factor = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
     cparams.yarn_beta_fast   = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
@@ -72,10 +89,12 @@ llama_context::llama_context(
     cparams.pooling_type     = params.pooling_type;
     cparams.warmup           = false;
 
+    // 上下文大小与 RoPE 基频：未指定时用模型训练值。
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     cparams.rope_freq_base   = params.rope_freq_base  == 0.0f ? hparams.rope_freq_base_train  : params.rope_freq_base;
     cparams.rope_freq_scale  = params.rope_freq_scale == 0.0f ? hparams.rope_freq_scale_train : params.rope_freq_scale;
 
+    // YaRN 原始上下文大小：用户 > 模型配置 > 训练上下文大小（按优先级回退）。
     cparams.n_ctx_orig_yarn  = params.yarn_orig_ctx    != 0 ? params.yarn_orig_ctx    :
                                hparams.n_ctx_orig_yarn != 0 ? hparams.n_ctx_orig_yarn :
                                                               hparams.n_ctx_train;
@@ -85,17 +104,22 @@ llama_context::llama_context(
 
     cparams.ctx_type          = params.ctx_type;
 
-    // Initialize backend samplers here so they are part of the sampling graph
-    // before the reserve passes run later in this function. This avoids a later
-    // re-reserve when graph nodes change.
+    // =========================================================================
+    // 后端采样器：必须在 sched_reserve() 之前注册。
+    // 调度器在 reserve 阶段会根据图节点拓扑分配 buffer；若采样节点 reserve 后
+    // 才添加，会触发第二次 reserve，进而影响已分配的 KV / 中间张量布局。
+    // =========================================================================
     if (params.samplers != nullptr && params.n_samplers > 0) {
         for (size_t i = 0; i < params.n_samplers; ++i) {
             const auto & config = params.samplers[i];
 
+            // 后端采样器只能是 llama_sampler_chain 链式类型，便于按 seq_id 调度。
             if (llama_sampler_chain_get(config.sampler, -1) == nullptr) {
                 throw std::runtime_error("the backend samplers must be of type llama_sampler_chain");
             }
 
+            // set_sampler 内部会判断采样器是否真的能 offload 到设备，
+            // 返回 true 表示已加入 sampling.samplers。
             if (set_sampler(config.seq_id, config.sampler)) {
                 const int n_samplers = llama_sampler_chain_n(config.sampler);
 
@@ -104,6 +128,10 @@ llama_context::llama_context(
         }
     }
 
+    // =========================================================================
+    // RoPE 缩放类型：未指定时回退到训练时使用的类型。
+    // NONE 表示完全不做缩放，因此 freq_scale 强制为 1（否则 NONE 无意义）。
+    // =========================================================================
     auto rope_scaling_type = params.rope_scaling_type;
     if (rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
         rope_scaling_type = hparams.rope_scaling_type_train;
@@ -113,10 +141,18 @@ llama_context::llama_context(
         cparams.rope_freq_scale = 1.0f; // never scale if scaling type is none
     }
 
-    if (cparams.yarn_ext_factor < 0.0f) { // negative indicates 'not set'
+    // yarn_ext_factor < 0 表示"未设置"：默认 YaRN 启用、其它缩放禁用。
+    if (cparams.yarn_ext_factor < 0.0f) {
         cparams.yarn_ext_factor = rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN ? 1.0f : 0.0f;
     }
 
+    // =========================================================================
+    // 计算 YaRN 注意力缩放因子（yarn_attn_factor）。
+    // 公式参考 transformers/modeling_rope_utils.py：
+    //   mscale(scale) = 0.1 * mscale * log(scale) + 1
+    // 当 rope_yarn_log_mul != 0（DeepSeek-V2 风格）时，需要反推外推时的 mscale
+    // 并与训练时单一 mscale 相除，等价于在 RoPE 输出上施加一个 attention temperature。
+    // =========================================================================
     if (cparams.yarn_ext_factor != 0) {
         static auto get_mscale = [](float scale, float mscale) {
             return scale <= 1.0f ? 1.0f : (0.1f * mscale * logf(scale) + 1.0f);
@@ -126,13 +162,14 @@ llama_context::llama_context(
 
         // ref: https://github.com/huggingface/transformers/blob/6d00f6b0a5679c36510f203e4226e36f517c3032/src/transformers/modeling_rope_utils.py#L336-L348
         if (hparams.rope_yarn_log_mul != 0.0f) {
-            // note: here we assume `mscale == 1.0f`
+            // 训练时使用单一 mscale_all_dims；外推时通常令 mscale == 1.0f。
             // TODO: start reading the actual value of mscale and handle the case where it is not 1.0f
                   float mscale          = 1.0f;
             const float mscale_all_dims = hparams.rope_yarn_log_mul;
 
             // [TAG_DEEPSEEK2_YARN_LOG_MUL_FIX]
-            // special-case DEEPSEEK v2:
+            // DeepSeek-V2 例外：单维度 mscale 与训练时 mscale_all_dims 都不为 1，
+            // 需要把两者都代入公式，避免注意力温度被错误缩放。
             // https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite-Chat/blob/main/config.json#L42-L43
             if (model.arch == LLM_ARCH_DEEPSEEK2 && mscale_all_dims != 1.0f) {
                 mscale = mscale_all_dims;
@@ -146,16 +183,17 @@ llama_context::llama_context(
             cparams.yarn_attn_factor = get_mscale(factor, 1.0f);
         }
 
-        // when YARN is applied with yarn_ext_factor != 0.0f, we need to cancel this factor:
-        // https://github.com/ggml-org/llama.cpp/blob/a81a569577cc38b32558958b048228150be63eae/ggml/src/ggml-cpu/ops.cpp#L5541-L5544
-        //
+        // yarn_ext_factor != 0 时，RoPE op 会再乘一次 (1 + 0.1*log(factor))，
+        // 这里反向抵消，保持 yarn_attn_factor 含义与原始 HF 定义一致。
         // ref: https://github.com/ggml-org/llama.cpp/discussions/7416
         //      https://github.com/ggml-org/llama.cpp/pull/17945
         cparams.yarn_attn_factor *= 1.0f / (1.0f + 0.1f * logf(factor));
     }
 
+    // 模型自定义的 attention factor 调整（如某些架构在 config 中独立设置的 attn factor）。
     cparams.yarn_attn_factor *= hparams.rope_attn_factor;
 
+    // 池化类型：用户 UNSPECIFIED 时优先用模型默认，都没有则 NONE。
     if (cparams.pooling_type == LLAMA_POOLING_TYPE_UNSPECIFIED) {
         if (hparams.pooling_type == LLAMA_POOLING_TYPE_UNSPECIFIED) {
             cparams.pooling_type = LLAMA_POOLING_TYPE_NONE;
@@ -164,30 +202,43 @@ llama_context::llama_context(
         }
     }
 
+    // =========================================================================
+    // 因果 Attention / Flash Attention / Fused GDN / batch 尺寸
+    // =========================================================================
+    // causal_attn：未指定时回退到模型默认；encoder-decoder 架构通常为非因果。
     if (params.attention_type == LLAMA_ATTENTION_TYPE_UNSPECIFIED) {
         cparams.causal_attn = hparams.causal_attn;
     } else {
         cparams.causal_attn = params.attention_type == LLAMA_ATTENTION_TYPE_CAUSAL;
     }
 
+    // Flash Attention：auto 模式下 cparams.auto_fa=true，sched_reserve 时会跑一个 dummy 图
+    // 探测当前设备是否真的支持 FA，再把 cparams.flash_attn 锁回 true/false。
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
+    // Fused Gated Delta Net：默认开启 auto 探测，由 sched_reserve 在最坏情况下试运行。
     cparams.fused_gdn_ar = true;
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = true;
 
-    // with causal attention, the batch size is limited by the context size
+    // n_batch：因果模型每个 batch 至多 n_ctx 个 token（KV 缓存不能循环复用）；
+    // 非因果模型（encoder）允许 batch 大于 n_ctx。
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
+    // n_ubatch：单次前向的 micro-batch 上界，受 n_batch 限制；未指定时与 n_batch 相等。
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
 
-    // initialized later
+    // pipeline_parallel 在下方根据多设备 + 层切分情况再决定，这里先置 false。
     cparams.pipeline_parallel = false;
 
+    // =========================================================================
+    // 图复用（graph reuse）：通过环境变量可关闭。
+    // 关闭后 process_ubatch 每次都重新 build_graph + alloc_graph，便于调试。
+    // =========================================================================
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
         graph_reuse_disable = LLAMA_GRAPH_REUSE_DISABLE ? (atoi(LLAMA_GRAPH_REUSE_DISABLE) != 0) : graph_reuse_disable;
@@ -197,9 +248,15 @@ llama_context::llama_context(
         }
     }
 
+    // =========================================================================
+    // 上下文大小对齐：把 n_ctx 向上对齐到 256 的倍数。
+    // 某些后端按 2D 块分配 KV 缓存，未对齐会浪费内存或导致额外 padding。
+    // =========================================================================
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
+    // kv_unified：true 时所有序列共享一份连续的 n_ctx 大小的 KV 缓存；
+    //            false 时为每条序列独立分配 n_ctx/n_seq_max 的 KV 区。
     if (cparams.kv_unified) {
         cparams.n_ctx_seq = cparams.n_ctx;
     } else {
@@ -211,6 +268,7 @@ llama_context::llama_context(
         }
 
         if (cparams.n_ctx != cparams.n_ctx_seq * cparams.n_seq_max) {
+            // 每条序列对齐到 256 后，总大小可能大于 n_ctx；这里把 n_ctx 同步下调。
             cparams.n_ctx =  cparams.n_ctx_seq * cparams.n_seq_max;
             LLAMA_LOG_WARN("%s: n_ctx is not divisible by n_seq_max - rounding down to %u\n", __func__, cparams.n_ctx);
         }
@@ -228,6 +286,7 @@ llama_context::llama_context(
     LLAMA_LOG_INFO("%s: freq_scale    = %g\n",   __func__, cparams.rope_freq_scale);
     LLAMA_LOG_INFO("%s: n_rs_seq      = %u\n",   __func__, cparams.n_rs_seq);
 
+    // 警告：上下文超出训练窗口时可能引发训练分布外推断；不足时无法利用全部能力。
     if (cparams.n_ctx_seq < hparams.n_ctx_train) {
         LLAMA_LOG_WARN("%s: n_ctx_seq (%u) < n_ctx_train (%u) -- the full capacity of the model will not be utilized\n",
                 __func__, cparams.n_ctx_seq, hparams.n_ctx_train);
@@ -239,6 +298,12 @@ llama_context::llama_context(
     }
 
     if (!hparams.vocab_only) {
+        // =========================================================================
+        // 步骤 2：初始化后端列表（顺序：GPU → ACCEL → CPU）
+        // 1. 遍历 model.devices 中声明的 GPU 设备，逐一 init
+        // 2. 追加所有 ACCEL 类型后端（如 BLAS）以加速部分算子
+        // 3. 最后追加 CPU 后端作为兜底（部分 op 必须 CPU 执行）
+        // =========================================================================
         // GPU backends
         for (const auto & dev : model.devices) {
             ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
@@ -267,6 +332,8 @@ llama_context::llama_context(
         }
         backends.emplace_back(backend_cpu);
 
+        // 收集每个 backend 的 set_n_threads 函数指针；
+        // graph_compute 时会调用它们把 CPU 线程数同步到所有后端。
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
@@ -279,8 +346,10 @@ llama_context::llama_context(
             }
         }
 
+        // 注册中止回调：用于在长时间 decode 中通过外部信号强制中断。
         llama_set_abort_callback(this, params.abort_callback, params.abort_callback_data);
 
+        // 首次预留输出缓冲区：大小为 1 个 seq 的最小值；decode 阶段会按需扩容。
         // graph outputs buffer
         {
             if (output_reserve(params.n_seq_max) < params.n_seq_max) {
@@ -293,6 +362,12 @@ llama_context::llama_context(
         }
     }
 
+    // =========================================================================
+    // 步骤 3：创建 KV 缓存内存模块
+    // 由 model.create_memory 根据架构选择具体实现：
+    //   Transformer 自注意 → llama_memory_recurrent
+    //   Mamba / SSM 状态   → llama_memory_state 等
+    // =========================================================================
     // init the memory module
     if (!hparams.vocab_only) {
         llama_memory_params params_mem = {
@@ -305,6 +380,9 @@ llama_context::llama_context(
         memory.reset(model.create_memory(params_mem, cparams));
     }
 
+    // =========================================================================
+    // 步骤 4：枚举后端、决策流水线并行、初始化调度器（sched_reserve）
+    // =========================================================================
     // init backends
     if (!hparams.vocab_only) {
         LLAMA_LOG_DEBUG("%s: enumerating backends\n", __func__);
@@ -317,6 +395,8 @@ llama_context::llama_context(
             auto * buft = ggml_backend_get_default_buffer_type(backend.get());
             auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
 
+            // CPU backend 在有多 GPU 时，优先使用第一块 GPU 的 host buffer：
+            // 这样 CPU 端中间张量可走 pinned memory，H2D/D2H 传输带宽更高。
             if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
                 // use the host buffer of the first device CPU for faster transfer of the intermediate state
                 const auto & dev = model.devices[0];
@@ -334,6 +414,12 @@ llama_context::llama_context(
         LLAMA_LOG_DEBUG("%s: backend_ptrs.size() = %zu\n", __func__, backend_ptrs.size());
 
         // TODO: move these checks to ggml_backend_sched
+        // 启用流水线并行的条件：
+        //   - 多设备
+        //   - 所有层都 offload 到 GPU（n_gpu_layers > n_layer）
+        //   - 按层切分（不是按张量切分）
+        //   - 启用 KV 缓存 offload
+        //   - 没有张量被手动重定向
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
         bool pipeline_parallel =
             model.n_devices() > 1 &&
@@ -342,6 +428,8 @@ llama_context::llama_context(
             cparams.offload_kqv &&
             !model.has_tensor_overrides();
 
+        // 流水线并行要求所有非 CPU 设备都支持 async compute 和 events，
+        // 否则 GPU 端上一次计算的输出尚未写完，CPU 已开始写入下一轮输入。
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
             for (auto & backend : backends) {
@@ -368,8 +456,13 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        // 最后调用 sched_reserve()：
+        //   - 创建 ggml_backend_sched
+        //   - 探测 FA / GDN 设备一致性
+        //   - 预分配"最坏情况"计算图 buffer
         sched_reserve();
 
+        // 量化 V 缓存必须搭配 Flash Attention 才能正确解码，否则直接拒绝启动。
         if (!cparams.flash_attn) {
             if (ggml_is_quantized(params.type_v)) {
                 throw std::runtime_error("quantized V cache was requested, but this requires Flash Attention");
@@ -377,6 +470,10 @@ llama_context::llama_context(
         }
     }
 
+    // =========================================================================
+    // 步骤 5：初始化后端采样所需的"全词表 token id"数组
+    // 后端采样器在 GPU 上构造 candidates 张量时需要 vocab 大小的索引数组。
+    // =========================================================================
     // Initialize the full vocabulary token ids for backend samplers.
     {
         const int n_vocab = model.vocab.n_tokens();

@@ -1160,6 +1160,7 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
 }
 
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
+    LLAMA_LOG_INFO("%s: [STEP 0] enter load_tensors()\n", __func__);
     const auto & split_mode   = params.split_mode;
     const auto & use_mlock    = params.use_mlock;
     const auto & tensor_split = params.tensor_split;
@@ -1170,12 +1171,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const bool use_mmap_buffer = true;
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
+    LLAMA_LOG_INFO("%s: [STEP 1] ml assigned to this->ml\n", __func__);
 
     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
         __func__, ml.use_mmap ? "true" : "false", ml.use_direct_io ? "true" : "false");
 
     // build a list of buffer types for the CPU and GPU devices
+    LLAMA_LOG_INFO("%s: [STEP 2] building cpu_buft_list\n", __func__);
     pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
+    LLAMA_LOG_INFO("%s: [STEP 2b] building gpu_buft_list for %zu devices\n", __func__, devices.size());
     for (const auto & dev : devices) {
         buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
         // add CPU buffer types as a fallback
@@ -1187,8 +1191,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (cpu_dev == nullptr) {
         throw std::runtime_error(format("%s: no CPU backend found", __func__));
     }
+    LLAMA_LOG_INFO("%s: [STEP 3] CPU backend found: %s\n", __func__, ggml_backend_dev_name(cpu_dev));
 
     // calculate the split points
+    LLAMA_LOG_INFO("%s: [STEP 4] calculating split points\n", __func__);
     bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + n_devices(), [](float x) { return x == 0.0f; });
     std::vector<float> splits(n_devices());
     if (all_zero) {
@@ -1220,6 +1226,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     for (size_t i = 0; i < n_devices(); ++i) {
         splits[i] /= split_sum;
     }
+    LLAMA_LOG_INFO("%s: [STEP 5] split points calculated, n_layer=%d, n_gpu_layers=%d, i_gpu_start=%d, act_gpu_layers=%d\n",
+        __func__, n_layer, n_gpu_layers, std::max(int(hparams.n_layer) + 1 - n_gpu_layers, 0), devices.empty() ? 0 : std::min(n_gpu_layers, int(n_layer) + 1));
 
     const int i_gpu_start = std::max(int(hparams.n_layer) + 1 - n_gpu_layers, 0);
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, int(n_layer) + 1);
@@ -1238,8 +1246,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // assign the input layer
     // there is very little benefit to offloading the input layer, so always keep it on the CPU
     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    LLAMA_LOG_INFO("%s: [STEP 6] input layer assigned to CPU\n", __func__);
 
     // assign the repeating layers to the devices according to the splits
+    LLAMA_LOG_INFO("%s: [STEP 7] assigning %d repeating layers to devices\n", __func__, n_layer);
     pimpl->dev_layer.resize(n_layer);
     for (int il = 0; il < n_layer; ++il) {
         pimpl->dev_layer[il] = get_layer_buft_list(il);
@@ -1247,10 +1257,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // assign the output layer
     pimpl->dev_output = get_layer_buft_list(n_layer);
+    LLAMA_LOG_INFO("%s: [STEP 8] output layer assigned\n", __func__);
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 
     // create tensors for the weights
+    LLAMA_LOG_INFO("%s: [STEP 9] starting to create weight tensors\n", __func__);
     {
         // TODO: move to a separate function
         const auto tn = LLM_TN(arch);
@@ -1265,7 +1277,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         layers.resize(n_layer);
 
         // call the per-model loading function
+        LLAMA_LOG_INFO("%s: [STEP 10] calling load_arch_tensors()\n", __func__);
         load_arch_tensors(ml);
+        LLAMA_LOG_INFO("%s: [STEP 11] load_arch_tensors() returned\n", __func__);
 
         // generic pass: load optional per-tensor/per-expert ".scale" tensors (e.g. NVFP4 scale2)
         // this avoids having to add scale loading to every architecture
@@ -1420,22 +1434,29 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
         }
     }
+    LLAMA_LOG_INFO("%s: [STEP 12] weight tensors created\n", __func__);
     ml.done_getting_tensors();
+    LLAMA_LOG_INFO("%s: [STEP 13] done_getting_tensors() called\n", __func__);
 
     GGML_ASSERT(!(output && tok_embd &&
             strcmp(output->name, tok_embd->name) == 0 &&
             output->type == GGML_TYPE_NVFP4));
     // populate tensors_by_name
+    LLAMA_LOG_INFO("%s: [STEP 14] populating tensors_by_name map\n", __func__);
     for (auto & [_, ctx_ptr] : ml.ctx_map) {
         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
         }
     }
+    LLAMA_LOG_INFO("%s: [STEP 15] tensors_by_name populated, total tensors: %zu\n", __func__, tensors_by_name.size());
 
+    LLAMA_LOG_INFO("%s: [STEP 16] initializing mappings\n", __func__);
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
+    LLAMA_LOG_INFO("%s: [STEP 17] mappings initialized\n", __func__);
 
     // create the backend buffers
+    LLAMA_LOG_INFO("%s: [STEP 18] creating backend buffers, ctx_map.size()=%zu\n", __func__, ml.ctx_map.size());
     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
     ctx_buf_maps.reserve(ml.ctx_map.size());
 
@@ -1525,6 +1546,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         ctx_buf_maps.emplace_back(ctx, buf_map);
     }
+    LLAMA_LOG_INFO("%s: [STEP 19] backend buffers created\n", __func__);
 
     if (llama_supports_gpu_offload()) {
         const int n_gpu = std::min(n_gpu_layers, int(hparams.n_layer));
@@ -1551,15 +1573,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     if (ml.no_alloc) {
+        LLAMA_LOG_INFO("%s: [STEP 20] no_alloc mode, skipping tensor data loading\n", __func__);
         return true;
     }
 
     // load tensor data
+    LLAMA_LOG_INFO("%s: [STEP 21] loading tensor data from files\n", __func__);
     for (auto & [ctx, buf_map] : ctx_buf_maps) {
         if (!ml.load_all_data(ctx, buf_map, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
     }
+    LLAMA_LOG_INFO("%s: [STEP 22] tensor data loaded\n", __func__);
 
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
@@ -1567,6 +1592,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    LLAMA_LOG_INFO("%s: [STEP 23] exit load_tensors(), returning true\n", __func__);
     return true;
 }
 
